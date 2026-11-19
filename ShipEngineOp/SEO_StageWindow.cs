@@ -513,97 +513,73 @@ namespace ShipEngineOptimization
 
         public static void PsoSelectedStages(List<StageConfig> optimizingStages, List<StageConfig> mockStageList)
         {
-            float totalDv = optimizingStages.Sum(s => s.targetDv);       
+            float totalDv = optimizingStages.Sum(s => s.targetDv);
             if (totalDv <= 0) { return; }
-            //if (optimizingStages.Sum(s => s.targetDv) <= 0) { return; }
 
-            // Define PSO parameters
             int totalVariables = optimizingStages.Count();
             int numParticles = 50;
-            int maxIterations = 1000; // Max iterations still acts as a safeguard
-            float inertiaWeight = 0.729f; // Common value for w
-            float cognitiveWeight = 1.49445f; // Common value for c1
-            float socialWeight = 1.49445f; // Common value for c2
+            int maxIterations = 1000;
+            float inertiaWeight = 0.729f;
+            float cognitiveWeight = 1.49445f;
+            float socialWeight = 1.49445f;
+            float fitnessTolerance = 1e-3f;
+            int consecutiveConvergedIterations = 10;
 
-            // Convergence parameters
-            float fitnessTolerance = 1e-3f; // Stop if fitness changes by less than this
-            int consecutiveConvergedIterations = 10; // For this many consecutive iterations
-
-            Debug.Log("Starting Particle Swarm Optimization...");
-            Debug.Log($"Target: Minimize f(x1) + ... + f(x{totalVariables}) where f(x) = x + 1/x");
-            Debug.Log($"Constraint: x1 + ... + x{totalVariables} = {totalDv}");
-            Debug.Log($"Stopping criterion: Fitness change < {fitnessTolerance:E1} for {consecutiveConvergedIterations} consecutive iterations (or max {maxIterations} iterations).");
+            Debug.Log("Starting deterministic stage-distribution optimization...");
+            Debug.Log($"Constraint: x1 + ... + x{totalVariables} = {totalDv:F2}");
             Debug.Log("--------------------------------------------------");
 
-            PsoOptimizer optimizer = new PsoOptimizer(totalVariables, numParticles, maxIterations,
-                                                    inertiaWeight, cognitiveWeight, socialWeight,
-                                                    totalDv, fitnessTolerance, consecutiveConvergedIterations);
-
-            optimizer.Optimize(optimizingStages, mockStageList);
-
-            Debug.Log("\nOptimization Complete!");
-            Debug.Log("--------------------------------------------------");
-            Debug.Log($"Global Best Fitness Found: {optimizer.GlobalBestFitness:F6}");
-
-
-            // Collect all N variables for display
-            float sumOfIndependent = 0f;
-            for (int i = 0; i < optimizer.GlobalBestPosition.Length; i++)
+            float[] optimizedAllocation;
+            try
             {
-                optimizingStages[i].targetDv = optimizer.GlobalBestPosition[i];
+                optimizedAllocation = AutoStageOptimizer.Optimize(
+                    optimizingStages, stages => GetTotalWeight(mockStageList));
             }
-            float totalWeight = GetTotalWeight(mockStageList);
-            var engineList = optimizingStages.Select(s => s.engineName).ToList();
-            for (int i = 0; i < optimizer.GlobalBestPosition.Length; i++)
+            catch (Exception optimizerException)
             {
-                var stage = optimizingStages[i];
+                Debug.LogWarning("[ShipEngineOp] Deterministic optimizer failed; falling back to PSO. " + optimizerException);
+
+                PsoOptimizer psoOptimizer = new PsoOptimizer(totalVariables, numParticles, maxIterations,
+                                                            inertiaWeight, cognitiveWeight, socialWeight,
+                                                            totalDv, fitnessTolerance, consecutiveConvergedIterations);
+                psoOptimizer.Optimize(optimizingStages, mockStageList);
+                optimizedAllocation = psoOptimizer.GlobalBestPosition;
+            }
+
+            Debug.Log("Optimization complete.");
+
+            for (int i = 0; i < optimizedAllocation.Length; i++)
+                optimizingStages[i].targetDv = optimizedAllocation[i];
+            GetTotalWeight(mockStageList);
+
+            var engineList = optimizingStages.Select(s => s.engineName).ToList();
+            float sumOfIndependent = 0f;
+
+            // Manual and onion stages keep the optimizer's rounded result. Auto stages
+            // can switch engine after final rounding, so give those engines +1 m/s and
+            // re-check the resulting configuration.
+            for (int i = 0; i < optimizingStages.Count - 1; i++)
+            {
+                StageConfig stage = optimizingStages[i];
                 if (stage.manualMode || stage.keepEngine)
                 {
-                    stage.targetDv = Mathf.Round(optimizer.GlobalBestPosition[i]);
+                    stage.targetDv = Mathf.Round(optimizedAllocation[i]);
                 }
                 else
                 {
-                    stage.targetDv = Mathf.Floor(optimizer.GlobalBestPosition[i]);
+                    stage.targetDv = Mathf.Floor(optimizedAllocation[i]);
                     stage.GetBestEngine();
-
-                    if (stage.engineName != engineList[i])
-                    { stage.targetDv += 1f; }
+                    if (stage.engineName != engineList[i]) stage.targetDv += 1f;
                 }
-                totalWeight = GetTotalWeight(mockStageList);
                 sumOfIndependent += stage.targetDv;
             }
-            //for (int i = 0; i < optimizer.GlobalBestPosition.Length; i++)
-            //{
-            //    optimizingStages[i].targetDv = Mathf.Floor(optimizer.GlobalBestPosition[i]);
-            //    sumOfIndependent += optimizingStages[i].targetDv;
-            //}
 
-            // Add the derived N-th variable
-            optimizingStages.Last().targetDv = totalDv - sumOfIndependent;
-            //Debug.Log($"sum of indepandents {sumOfIndependent:F6}");
-            //Debug.Log($"total dv {totalDv:F6}");
+            StageConfig lastStage = optimizingStages.Last();
+            lastStage.targetDv = Math.Max(0f, totalDv - sumOfIndependent);
+            GetTotalWeight(mockStageList);
 
             for (int i = 0; i < optimizingStages.Count; i++)
-            {
-                Debug.Log($"Optimal x{i + 1}: {optimizingStages[i].targetDv:F6}");
-            }
-
-            //List<float> finalVariables = new List<float>();
-            //float sumOfIndependent = 0f;
-            //for (int i = 0; i < optimizer.GlobalBestPosition.Length; i++)
-            //{
-            //    finalVariables.Add(optimizer.GlobalBestPosition[i]);
-            //    sumOfIndependent += optimizer.GlobalBestPosition[i];
-            //}
-
-            //finalVariables.Add(totalDv - sumOfIndependent);
-
-            //for (int i = 0; i < finalVariables.Count; i++)
-            //{
-            //    optimizingStages[i].targetDv = finalVariables[i];
-            //    Debug.Log($"Optimal x{i + 1}: {finalVariables[i]:F6}");
-            //}
-            //Debug.Log($"Sum of all variables: {finalVariables.Sum():F6} (should be close to {totalDv})");
+                Debug.Log($"Optimal x{i + 1}: {optimizingStages[i].targetDv:F2}");
         }
 
         public static float GetTotalWeight(List<StageConfig> mockStages)

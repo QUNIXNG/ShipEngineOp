@@ -40,10 +40,12 @@ namespace ShipEngineOptimization
 
         public void SetPlanet(string planetInput)
         {
-            planetNameStr = planetInput;
             var planet = FlightGlobals.Bodies.FirstOrDefault(b => b.bodyName == planetInput);
+            if (planet == null) return;
+            planetNameStr = planetInput;
             surfaceGravity = (float)(planet.gravParameter / (planet.Radius * planet.Radius));
             altitude = (float)planet.atmosphereDepth;
+            SEO_OptimizationCache.ClearEngineCache();
         }
 
         public void SetEngineData(string nameInput)
@@ -119,28 +121,37 @@ namespace ShipEngineOptimization
 
         void SetIspAndThrust()
         {
-            var planet = FlightGlobals.Bodies.FirstOrDefault(b => b.bodyName == planetNameStr);
-            if (planet == null) return;
+            SEO_OptimizationCache.EnginePerformance cached;
+            float atm = SEO_OptimizationCache.GetAtmosphere(planetNameStr, altitude);
+            if (SEO_OptimizationCache.TryGetEngine(engineName, engineData.internalName, atm, engineData.modeIdx, out cached))
+            {
+                realIsp = cached.Isp;
+                realThrust = cached.Thrust;
+                return;
+            }
 
-            float atm = (float)FlightGlobals.getStaticPressure(altitude, planet) / SEO_Main.standardAtm;
+            var part = SEO_OptimizationCache.GetPart(engineData.internalName);
+            if (part == null || part.partPrefab == null) return;
 
-            var part = PartLoader.LoadedPartsList.FirstOrDefault(p => p.name == engineData.internalName);
             if (part.partPrefab.Modules.Contains("ModuleEngines") || part.partPrefab.Modules.Contains("ModuleEnginesFX"))
             {
                 if (engineData.modeIdx == 0)
                 {
-                    var engineModule = part?.partPrefab?.Modules.GetModule<ModuleEngines>();
-                    if (part == null || engineModule == null) { realIsp = 0f; }
+                    var engineModule = part.partPrefab.Modules.GetModule<ModuleEngines>();
+                    if (engineModule == null) { realIsp = 0f; realThrust = 0f; return; }
                     realIsp = engineModule.atmosphereCurve.Evaluate(atm);
                 }
                 else
                 {
                     var multiModeModule = part.partPrefab.Modules.GetModule<MultiModeEngine>();
+                    if (multiModeModule == null) { realIsp = 0f; realThrust = 0f; return; }
                     string engineMode = engineData.modeIdx == 1 ? multiModeModule.primaryEngineID : multiModeModule.secondaryEngineID;
                     var engineModule = part.partPrefab.FindModulesImplementing<ModuleEngines>().FirstOrDefault(e => e.engineID == engineMode);
+                    if (engineModule == null) { realIsp = 0f; realThrust = 0f; return; }
                     realIsp = engineModule.atmosphereCurve.Evaluate(atm);
                 }
                 realThrust = engineData.thrust * (realIsp / engineData.isp);
+                SEO_OptimizationCache.StoreEngine(engineName, engineData.internalName, atm, engineData.modeIdx, realIsp, realThrust);
             }
             else if (SEO_Main.realFuelsInstalled)
             { SetIspAndThrustRF(part, engineData.thrust, atm, engineData.modeIdx); }
@@ -150,6 +161,7 @@ namespace ShipEngineOptimization
         void SetIspAndThrustRF(AvailablePart part, float maxThrust, float atm, int modeIdx)
         {
             var moduleConfig = part.partPrefab.Modules.GetModule<ModuleEngineConfigs>();
+            if (moduleConfig == null || moduleConfig.configs == null || modeIdx >= moduleConfig.configs.Count) return;
             var config = moduleConfig.configs[modeIdx];
             float maxIsp;
             //var config = part.partPrefab.Modules.GetModule<ModuleEngineConfigs>().configs[modeIdx];
@@ -180,6 +192,7 @@ namespace ShipEngineOptimization
                 realIsp = newAtmoCurve.Evaluate(atm);
             }
             realThrust = maxThrust * realIsp / maxIsp;
+            if (maxIsp > 0f) SEO_OptimizationCache.StoreEngine(engineName, part.name, atm, modeIdx, realIsp, realThrust);
         }
         //void SetIspAndThrust()
         //{

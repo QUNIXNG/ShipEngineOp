@@ -434,6 +434,8 @@ namespace ShipEngineOptimization
             Debug.Log("activate refresh engine");
             engineData.Clear();
             groupedEngines.Clear();
+            SEO_OptimizationCache.ClearParts();
+            SEO_OptimizationCache.ClearEngineCache();
 
             groupedEngines.Add("None", new List<string> { emptyStr });
             engineData[emptyStr] = (0, 0, 0, 1, "", 0);

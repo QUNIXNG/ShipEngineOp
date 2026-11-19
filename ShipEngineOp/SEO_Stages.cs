@@ -77,10 +77,12 @@ namespace ShipEngineOptimization
 
         public void SetPlanet(string planetInput)
         {
-            planetNameStr = planetInput;
             var planet = FlightGlobals.Bodies.FirstOrDefault(b => b.bodyName == planetInput);
+            if (planet == null) return;
+            planetNameStr = planetInput;
             surfaceGravity = (float)(planet.gravParameter / (planet.Radius * planet.Radius));
             altitude = (float)planet.atmosphereDepth;
+            SEO_OptimizationCache.ClearEngineCache();
         }
 
         void ResetShipSpecs()
@@ -115,11 +117,7 @@ namespace ShipEngineOptimization
             }
 
             float truePayload = payloadMass + additionalMass;
-
-            var planet = FlightGlobals.Bodies.FirstOrDefault(b => b.bodyName == planetNameStr);
-            if (planet == null) return;
-
-            float atm = (float)FlightGlobals.getStaticPressure(altitude, planet) / SEO_Main.standardAtm;
+            float atm = SEO_OptimizationCache.GetAtmosphere(planetNameStr, altitude);
             (string Name, float weight, float wdr, float weightTotal, float twr, float dv, float fuelMass, int qtyEng) shipSpecs;
 
             if (manualMode || keepEngine)
@@ -151,10 +149,7 @@ namespace ShipEngineOptimization
         public List<(string Name, float weight, float wdr, float weightTotal, float twr, float dv, float fuelMass, int qtyEng)> GetTopEngineList(HashSet<string> selectedFuel)
         {
             float truePayload = payloadMass + additionalMass;
-
-            var planet = FlightGlobals.Bodies.FirstOrDefault(b => b.bodyName == planetNameStr);
-
-            float atm = (float)FlightGlobals.getStaticPressure(altitude, planet) / SEO_Main.standardAtm;
+            float atm = SEO_OptimizationCache.GetAtmosphere(planetNameStr, altitude);
 
             return selectedFuel
                 .Where(fuel => SEO_Main.groupedEngines.ContainsKey(fuel))
@@ -232,38 +227,39 @@ namespace ShipEngineOptimization
 
         (float isp, float thrust) GetIspAndThrust(string name, string internalName, float atm, int modeIdx)
         {
-            var part = PartLoader.LoadedPartsList.FirstOrDefault(p => p.name == internalName);
+            SEO_OptimizationCache.EnginePerformance cached;
+            if (SEO_OptimizationCache.TryGetEngine(name, internalName, atm, modeIdx, out cached))
+                return (cached.Isp, cached.Thrust);
+
+            var part = SEO_OptimizationCache.GetPart(internalName);
             float realIsp;
             float realThrust;
+            if (part == null || part.partPrefab == null) return (0f, 0f);
+
             if (part.partPrefab.Modules.Contains("ModuleEngines") || part.partPrefab.Modules.Contains("ModuleEnginesFX"))
             {
+                ModuleEngines engineModule = null;
                 if (modeIdx == 0)
                 {
-                    var engineModule = part?.partPrefab?.Modules.GetModule<ModuleEngines>();
-
-                    if (part == null || engineModule == null) { return (0f, 0f); }
-
-                    //Debug.Log(internalName);
-                    //Debug.Log(part.title);
-                    //Debug.Log("atm = " + atm.ToString());
-                    realIsp = engineModule.atmosphereCurve.Evaluate(atm);
-                    realThrust = (realIsp / engineModule.atmosphereCurve.Evaluate(0)) * engineModule.maxThrust;
-                    return (realIsp, realThrust);
+                    engineModule = part.partPrefab.Modules.GetModule<ModuleEngines>();
                 }
                 else
                 {
                     var multiModeModule = part.partPrefab.Modules.GetModule<MultiModeEngine>();
+                    if (multiModeModule == null) return (0f, 0f);
 
                     string engineMode = modeIdx == 1 ? multiModeModule.primaryEngineID : multiModeModule.secondaryEngineID;
-
-                    //Debug.Log(part.title);
-                    var engineModule = part.partPrefab.FindModulesImplementing<ModuleEngines>().FirstOrDefault(e => e.engineID == engineMode);
-                    //Debug.Log(engineMode);
-                    //Debug.Log(engineModule.atmosphereCurve.Evaluate(atm));
-                    realIsp = engineModule.atmosphereCurve.Evaluate(atm);
-                    realThrust = (realIsp / engineModule.atmosphereCurve.Evaluate(0)) * engineModule.maxThrust;
-                    return (realIsp, realThrust);
+                    engineModule = part.partPrefab.FindModulesImplementing<ModuleEngines>().FirstOrDefault(e => e.engineID == engineMode);
                 }
+
+                if (engineModule == null) return (0f, 0f);
+
+                float seaLevelIsp = engineModule.atmosphereCurve.Evaluate(0);
+                if (seaLevelIsp == 0f) return (0f, 0f);
+                realIsp = engineModule.atmosphereCurve.Evaluate(atm);
+                realThrust = (realIsp / seaLevelIsp) * engineModule.maxThrust;
+                SEO_OptimizationCache.StoreEngine(name, internalName, atm, modeIdx, realIsp, realThrust);
+                return (realIsp, realThrust);
             }
             else
             { return GetIspAndThrustRF(name, part, atm, modeIdx); }
@@ -271,7 +267,12 @@ namespace ShipEngineOptimization
 
         (float isp, float thrust) GetIspAndThrustRF(string name, AvailablePart part, float atm, int modeIdx)
         {
+            SEO_OptimizationCache.EnginePerformance cached;
+            if (SEO_OptimizationCache.TryGetEngine(name, part.name, atm, modeIdx, out cached))
+                return (cached.Isp, cached.Thrust);
+
             var moduleConfig = part.partPrefab.Modules.GetModule<ModuleEngineConfigs>();
+            if (moduleConfig == null || moduleConfig.configs == null || modeIdx >= moduleConfig.configs.Count) return (0f, 0f);
             var config = moduleConfig.configs[modeIdx];
             float realIsp;
             float realThrust;
@@ -305,6 +306,7 @@ namespace ShipEngineOptimization
             }
             realThrust = SEO_Main.engineData[name].thrust * realIsp / maxIsp;
 
+            if (maxIsp > 0f) SEO_OptimizationCache.StoreEngine(name, part.name, atm, modeIdx, realIsp, realThrust);
             return (realIsp,  realThrust);
         }
 

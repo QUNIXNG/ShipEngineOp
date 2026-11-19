@@ -87,6 +87,8 @@
     <None Include="SEO_CommonFunctions.cs" />
     <None Include="SEO_GraphWindow_lecacy.cs" />
     <Compile Include="SEO_EngineStats.cs" />
+    <Compile Include="SEO_AutoStageOptimizer.cs" />
+    <Compile Include="SEO_OptimizationCache.cs" />
     <Compile Include="SEO_Main.cs" />
     <Compile Include="SEO_GraphWindow.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
