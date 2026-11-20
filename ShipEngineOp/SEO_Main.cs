@@ -12,6 +12,8 @@ namespace ShipEngineOptimization
     [KSPAddon(KSPAddon.Startup.EditorAny, false)]
     public class SEO_Main : MonoBehaviour
     {
+        public static SEO_Main instance;
+
         public static bool showMainWindow = false;
         public static bool showIndiWindow = false;
         public static bool showEngineList = false;
@@ -55,6 +57,7 @@ namespace ShipEngineOptimization
 
         void Start()
         {
+            instance = this;
             Debug.Log("[ShipEngineOp] Mod Initialized in Editor!");
             //LoadWdrFromConfig();
             LoadPropWdrFromConfig();
@@ -172,6 +175,8 @@ namespace ShipEngineOptimization
                 SetupTooltip();
                 GUI.Window(1234, tooltipRect, TooltipWindow, "");
             }
+
+            SEO_StageWindow.DrawOperationOverlay();
         }
 
         public static float standardGravity = (float)(Planetarium.fetch.Home.gravParameter / (Planetarium.fetch.Home.Radius * Planetarium.fetch.Home.Radius));
@@ -292,6 +297,7 @@ namespace ShipEngineOptimization
                         { blacklistEngines.Add(engine); }
                         else
                         { blacklistEngines.Remove(engine); }
+                        SEO_OptimizationCache.InvalidateSelections();
                         //if (blacklistEngines.Contains(engine))
                         //{ blacklistEngines.Remove(engine); }
                         //else
@@ -305,6 +311,7 @@ namespace ShipEngineOptimization
                     if (newAddiWeightToggle != additionalWeight[engine].toggle || newAddiWeight != additionalWeight[engine].addiWeight)
                     {
                         additionalWeight[engine] = (newAddiWeightToggle, newAddiWeight);
+                        SEO_OptimizationCache.InvalidateSelections();
                     }
 
                     GUILayout.EndHorizontal();
@@ -436,6 +443,7 @@ namespace ShipEngineOptimization
             groupedEngines.Clear();
             SEO_OptimizationCache.ClearParts();
             SEO_OptimizationCache.ClearEngineCache();
+            SEO_OptimizationCache.InvalidateSelections();
 
             groupedEngines.Add("None", new List<string> { emptyStr });
             engineData[emptyStr] = (0, 0, 0, 1, "", 0);

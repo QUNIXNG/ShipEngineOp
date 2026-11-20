@@ -83,6 +83,7 @@ namespace ShipEngineOptimization
             surfaceGravity = (float)(planet.gravParameter / (planet.Radius * planet.Radius));
             altitude = (float)planet.atmosphereDepth;
             SEO_OptimizationCache.ClearEngineCache();
+            SEO_OptimizationCache.InvalidateSelections();
         }
 
         void ResetShipSpecs()
@@ -126,7 +127,7 @@ namespace ShipEngineOptimization
             }
             else
             {
-                shipSpecs = GetTopEngineList(SEO_StageWindow.selectedFuelGlobal).FirstOrDefault();
+                shipSpecs = GetBestEngineSelection(truePayload, atm);
             }
 
             if (shipSpecs.weightTotal == float.MaxValue || shipSpecs.weightTotal == 0)
@@ -144,6 +145,35 @@ namespace ShipEngineOptimization
                 trueDv = constrainOp == 0 ? targetDv : shipSpecs.dv;
                 trueTwr = constrainOp == 1 ? targetTwr : shipSpecs.twr;
             }
+        }
+
+        /// <summary>
+        /// Engine ranking is by far the most expensive step of an optimization run, and neighbouring
+        /// allocations usually ask for almost the same thing. Cache just the winning configuration.
+        /// </summary>
+        private (string Name, float weight, float wdr, float weightTotal, float twr, float dv, float fuelMass, int qtyEng)
+            GetBestEngineSelection(float truePayload, float atm)
+        {
+            SEO_OptimizationCache.Selection cached;
+            if (SEO_OptimizationCache.TryGetSelection(atm, truePayload, targetDv, targetTwr, constrainOp, filterT, qtyFilter, out cached))
+            {
+                return (cached.Name, cached.Weight, cached.Wdr, cached.WeightTotal, cached.Twr, cached.Dv, cached.FuelMass, cached.QtyEng);
+            }
+
+            var best = GetTopEngineList(SEO_StageWindow.selectedFuelGlobal).FirstOrDefault();
+
+            SEO_OptimizationCache.Selection stored;
+            stored.Name = best.Name;
+            stored.Weight = best.weight;
+            stored.Wdr = best.wdr;
+            stored.WeightTotal = best.weightTotal;
+            stored.Twr = best.twr;
+            stored.Dv = best.dv;
+            stored.FuelMass = best.fuelMass;
+            stored.QtyEng = best.qtyEng;
+            SEO_OptimizationCache.StoreSelection(atm, truePayload, targetDv, targetTwr, constrainOp, filterT, qtyFilter, stored);
+
+            return best;
         }
 
         public List<(string Name, float weight, float wdr, float weightTotal, float twr, float dv, float fuelMass, int qtyEng)> GetTopEngineList(HashSet<string> selectedFuel)
@@ -227,8 +257,11 @@ namespace ShipEngineOptimization
 
         (float isp, float thrust) GetIspAndThrust(string name, string internalName, float atm, int modeIdx)
         {
+            int engineId = SEO_OptimizationCache.GetEngineId(name);
+            int atmBucket = SEO_OptimizationCache.QuantizeAtmosphere(atm);
+
             SEO_OptimizationCache.EnginePerformance cached;
-            if (SEO_OptimizationCache.TryGetEngine(name, internalName, atm, modeIdx, out cached))
+            if (SEO_OptimizationCache.TryGetEngine(engineId, atmBucket, modeIdx, out cached))
                 return (cached.Isp, cached.Thrust);
 
             var part = SEO_OptimizationCache.GetPart(internalName);
@@ -258,7 +291,7 @@ namespace ShipEngineOptimization
                 if (seaLevelIsp == 0f) return (0f, 0f);
                 realIsp = engineModule.atmosphereCurve.Evaluate(atm);
                 realThrust = (realIsp / seaLevelIsp) * engineModule.maxThrust;
-                SEO_OptimizationCache.StoreEngine(name, internalName, atm, modeIdx, realIsp, realThrust);
+                SEO_OptimizationCache.StoreEngine(engineId, atmBucket, modeIdx, realIsp, realThrust);
                 return (realIsp, realThrust);
             }
             else
@@ -267,8 +300,11 @@ namespace ShipEngineOptimization
 
         (float isp, float thrust) GetIspAndThrustRF(string name, AvailablePart part, float atm, int modeIdx)
         {
+            int engineId = SEO_OptimizationCache.GetEngineId(name);
+            int atmBucket = SEO_OptimizationCache.QuantizeAtmosphere(atm);
+
             SEO_OptimizationCache.EnginePerformance cached;
-            if (SEO_OptimizationCache.TryGetEngine(name, part.name, atm, modeIdx, out cached))
+            if (SEO_OptimizationCache.TryGetEngine(engineId, atmBucket, modeIdx, out cached))
                 return (cached.Isp, cached.Thrust);
 
             var moduleConfig = part.partPrefab.Modules.GetModule<ModuleEngineConfigs>();
@@ -306,7 +342,7 @@ namespace ShipEngineOptimization
             }
             realThrust = SEO_Main.engineData[name].thrust * realIsp / maxIsp;
 
-            if (maxIsp > 0f) SEO_OptimizationCache.StoreEngine(name, part.name, atm, modeIdx, realIsp, realThrust);
+            if (maxIsp > 0f) SEO_OptimizationCache.StoreEngine(engineId, atmBucket, modeIdx, realIsp, realThrust);
             return (realIsp,  realThrust);
         }
 

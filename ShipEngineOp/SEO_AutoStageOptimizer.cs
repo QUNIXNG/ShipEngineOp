@@ -1,146 +1,279 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Linq;
 
 namespace ShipEngineOptimization
 {
     /// <summary>
     /// Deterministic replacement for the random particle-swarm allocation.
-    /// It minimizes a caller-supplied vessel-mass objective subject to a fixed total Δv.
+    /// It minimises a caller-supplied vessel-mass objective subject to a fixed total Δv.
     /// </summary>
     public static class AutoStageOptimizer
     {
-        private const float MinStageDv = 1e-4f;
+        internal const float MinStageDv = 1e-4f;
         private const float IntervalTolerance = 0.001f;
         private const float WeightImprovement = 1e-4f;
         private const int MaxGoldenIterations = 80;
         private const int MaxPairSweeps = 60;
 
+        /// <summary>Runs the search to completion. Kept for the fallback path and offline tests.</summary>
         public static float[] Optimize(
             List<StageConfig> optimizingStages,
             Func<List<StageConfig>, float> evaluate)
         {
-            if (optimizingStages == null || optimizingStages.Count == 0 || evaluate == null)
-                return new float[0];
+            Run run = new Run(optimizingStages, evaluate);
+            run.Step(int.MaxValue);
+            return run.Best;
+        }
 
-            float[] originalAllocation = ReadAllocations(optimizingStages);
-            float totalDv = 0f;
-            foreach (float value in originalAllocation) totalDv += value;
+        /// <summary>
+        /// Incremental version of the same search, so the editor can spread the work over frames
+        /// instead of freezing while it runs.
+        /// </summary>
+        public sealed class Run
+        {
+            private readonly List<StageConfig> optimizingStages;
+            private readonly Func<List<StageConfig>, float> evaluate;
+            private readonly float[] originalAllocation;
+            private readonly float totalDv;
+            private readonly int stageCount;
+            private readonly int seedCount;
+            private readonly List<float[]> seeds;
+            private readonly Dictionary<ulong, float> objectiveCache = new Dictionary<ulong, float>();
 
-            int n = optimizingStages.Count;
-            if (totalDv <= 0f) return Clone(originalAllocation);
-            if (n == 1) return new float[] { totalDv };
+            private float[] current;
+            private float currentWeight;
+            private float[] best;
+            private float bestWeight = float.MaxValue;
+            private bool hasValidResult;
 
-            Dictionary<string, float> objectiveCache = new Dictionary<string, float>();
-            float[] bestAllocation = Clone(originalAllocation);
-            float bestWeight = EvaluateAllocation(optimizingStages, bestAllocation, evaluate, objectiveCache);
-            bool hasValidResult = bestWeight < float.MaxValue;
+            private int seedIndex;
+            private int sweepIndex;
+            private int pairIndex;
+            private bool sweepImproved;
 
-            foreach (float[] start in CreateInitialCandidates(optimizingStages, originalAllocation, n, totalDv))
+            public int Evaluations { get; private set; }
+            public bool Finished { get; private set; }
+            public bool Cancelled { get; private set; }
+
+            public float[] Best
             {
-                float[] current = Normalize(start, totalDv, n);
-                float currentWeight = EvaluateAllocation(optimizingStages, current, evaluate, objectiveCache);
-                if (currentWeight >= float.MaxValue) continue;
-
-                for (int sweep = 0; sweep < MaxPairSweeps; sweep++)
+                get
                 {
-                    bool improved = false;
+                    if (best == null) return Clone(originalAllocation);
+                    return Normalize(best, totalDv, stageCount);
+                }
+            }
 
-                    for (int pair = 0; pair < n - 1; pair++)
+            /// <summary>Rough progress in 0..1, only used to draw a progress bar.</summary>
+            public float Progress
+            {
+                get
+                {
+                    if (Finished) return 1f;
+                    if (stageCount < 2) return 1f;
+
+                    float pairsPerSeed = Math.Max(1, stageCount - 1);
+                    float expected = seedCount * pairsPerSeed * 8f;
+                    if (expected <= 0f) return 0f;
+
+                    float done = seedIndex * pairsPerSeed * 8f + sweepIndex * pairsPerSeed + pairIndex;
+                    float value = done / expected;
+                    return value < 0f ? 0f : (value > 0.99f ? 0.99f : value);
+                }
+            }
+
+            public Run(List<StageConfig> optimizingStages, Func<List<StageConfig>, float> evaluate)
+            {
+                this.optimizingStages = optimizingStages;
+                this.evaluate = evaluate;
+                this.originalAllocation = ReadAllocations(optimizingStages);
+                this.stageCount = optimizingStages.Count;
+
+                float sum = 0f;
+                for (int i = 0; i < originalAllocation.Length; i++) sum += originalAllocation[i];
+                this.totalDv = sum;
+
+                this.seeds = new List<float[]>(CreateInitialCandidates(originalAllocation, stageCount, totalDv));
+                this.seedCount = seeds.Count;
+
+                best = Clone(originalAllocation);
+
+                if (stageCount <= 1 || totalDv <= 0f)
+                {
+                    Finished = true;
+                    return;
+                }
+
+                BeginSeed();
+            }
+
+            public void Cancel()
+            {
+                Cancelled = true;
+                Finished = true;
+            }
+
+            /// <summary>Advances the search until the evaluation budget is exhausted.</summary>
+            public void Step(int evaluationBudget)
+            {
+                if (Finished) return;
+
+                long budgetEnd = (long)Evaluations + Math.Max(1, evaluationBudget);
+
+                while (!Finished && Evaluations < budgetEnd)
+                {
+                    if (pairIndex >= stageCount - 1)
                     {
-                        float otherSum = 0f;
-                        for (int i = 0; i < n; i++)
-                            if (i != pair && i != pair + 1) otherSum += current[i];
+                        if (!sweepImproved) { NextSeed(); continue; }
 
-                        float pairTotal = totalDv - otherSum;
-                        if (pairTotal <= 2f * MinStageDv) continue;
+                        sweepIndex++;
+                        pairIndex = 0;
+                        sweepImproved = false;
 
-                        float lower = MinStageDv;
-                        float upper = pairTotal - MinStageDv;
-                        const float phi = 0.6180339887498949f;
-
-                        float a = upper - phi * (upper - lower);
-                        float b = lower + phi * (upper - lower);
-                        float fa = EvaluatePairMember(optimizingStages, current, pair, pairTotal, a, evaluate, objectiveCache);
-                        float fb = EvaluatePairMember(optimizingStages, current, pair, pairTotal, b, evaluate, objectiveCache);
-
-                        float bestPair = fa <= fb ? a : b;
-                        float bestPairWeight = Math.Min(fa, fb);
-
-                        for (int iteration = 0;
-                             iteration < MaxGoldenIterations && upper - lower > IntervalTolerance;
-                             iteration++)
-                        {
-                            if (fa <= fb)
-                            {
-                                upper = b;
-                                b = a;
-                                fb = fa;
-                                a = upper - phi * (upper - lower);
-                                fa = EvaluatePairMember(optimizingStages, current, pair, pairTotal, a, evaluate, objectiveCache);
-                            }
-                            else
-                            {
-                                lower = a;
-                                a = b;
-                                fa = fb;
-                                b = lower + phi * (upper - lower);
-                                fb = EvaluatePairMember(optimizingStages, current, pair, pairTotal, b, evaluate, objectiveCache);
-                            }
-
-                            if (fa < bestPairWeight)
-                            {
-                                bestPairWeight = fa;
-                                bestPair = a;
-                            }
-                            if (fb < bestPairWeight)
-                            {
-                                bestPairWeight = fb;
-                                bestPair = b;
-                            }
-                        }
-
-                        if (bestPairWeight < currentWeight - WeightImprovement)
-                        {
-                            current[pair] = bestPair;
-                            current[pair + 1] = pairTotal - bestPair;
-                            currentWeight = bestPairWeight;
-                            improved = true;
-                        }
-                        else
-                        {
-                            // Restore the stage used by the trial evaluations.
-                            EvaluateAllocation(optimizingStages, current, evaluate, objectiveCache);
-                        }
+                        if (sweepIndex >= MaxPairSweeps) { NextSeed(); }
+                        continue;
                     }
 
-                    if (!improved) break;
+                    RunPair();
+                    pairIndex++;
+                }
+            }
+
+            private void BeginSeed()
+            {
+                if (seedIndex >= seedCount)
+                {
+                    Finished = true;
+                    if (!hasValidResult)
+                    {
+                        Apply(optimizingStages, originalAllocation);
+                    }
+                    return;
+                }
+
+                current = Normalize(seeds[seedIndex], totalDv, stageCount);
+                currentWeight = EvaluateAllocation(current);
+                sweepIndex = 0;
+                pairIndex = 0;
+                sweepImproved = false;
+
+                if (currentWeight >= float.MaxValue)
+                {
+                    seedIndex++;
+                    BeginSeed();
+                }
+            }
+
+            private void NextSeed()
+            {
+                seedIndex++;
+                BeginSeed();
+            }
+
+            private void RunPair()
+            {
+                int pair = pairIndex;
+
+                float otherSum = 0f;
+                for (int i = 0; i < stageCount; i++)
+                {
+                    if (i != pair && i != pair + 1) otherSum += current[i];
+                }
+
+                float pairTotal = totalDv - otherSum;
+                if (pairTotal <= 2f * MinStageDv) return;
+
+                float lower = MinStageDv;
+                float upper = pairTotal - MinStageDv;
+                const float phi = 0.6180339887498949f;
+
+                float a = upper - phi * (upper - lower);
+                float b = lower + phi * (upper - lower);
+                float fa = EvaluatePairMember(pair, pairTotal, a);
+                float fb = EvaluatePairMember(pair, pairTotal, b);
+
+                float bestPair = fa <= fb ? a : b;
+                float bestPairWeight = Math.Min(fa, fb);
+
+                for (int iteration = 0; iteration < MaxGoldenIterations && upper - lower > IntervalTolerance; iteration++)
+                {
+                    if (fa <= fb)
+                    {
+                        upper = b;
+                        b = a;
+                        fb = fa;
+                        a = upper - phi * (upper - lower);
+                        fa = EvaluatePairMember(pair, pairTotal, a);
+                    }
+                    else
+                    {
+                        lower = a;
+                        a = b;
+                        fa = fb;
+                        b = lower + phi * (upper - lower);
+                        fb = EvaluatePairMember(pair, pairTotal, b);
+                    }
+
+                    if (fa < bestPairWeight) { bestPairWeight = fa; bestPair = a; }
+                    if (fb < bestPairWeight) { bestPairWeight = fb; bestPair = b; }
+                }
+
+                if (bestPairWeight < currentWeight - WeightImprovement)
+                {
+                    current[pair] = bestPair;
+                    current[pair + 1] = pairTotal - bestPair;
+                    currentWeight = bestPairWeight;
+                    sweepImproved = true;
+                }
+                else
+                {
+                    EvaluateAllocation(current);
                 }
 
                 if (currentWeight < bestWeight)
                 {
                     bestWeight = currentWeight;
-                    bestAllocation = Clone(current);
+                    best = Clone(current);
+                    hasValidResult = true;
                 }
             }
 
-            if (!hasValidResult && bestWeight >= float.MaxValue)
+            private float EvaluatePairMember(int pair, float pairTotal, float firstStageDv)
             {
-                Apply(optimizingStages, originalAllocation);
-                return Clone(originalAllocation);
+                float savedLeft = current[pair];
+                float savedRight = current[pair + 1];
+
+                current[pair] = Clamp(firstStageDv, MinStageDv, pairTotal - MinStageDv);
+                current[pair + 1] = pairTotal - current[pair];
+
+                float weight = EvaluateAllocation(current);
+
+                current[pair] = savedLeft;
+                current[pair + 1] = savedRight;
+                return weight;
             }
 
-            float[] normalizedBest = Normalize(bestAllocation, totalDv, n);
-            Apply(optimizingStages, normalizedBest);
-            return normalizedBest;
+            private float EvaluateAllocation(float[] allocation)
+            {
+                ulong key = AllocationKey(allocation);
+                float cached;
+                if (objectiveCache.TryGetValue(key, out cached))
+                {
+                    Apply(optimizingStages, allocation);
+                    return cached;
+                }
+
+                Apply(optimizingStages, allocation);
+                Evaluations++;
+                float weight = evaluate(optimizingStages);
+                objectiveCache[key] = weight;
+                return weight;
+            }
         }
 
         private static IEnumerable<float[]> CreateInitialCandidates(
-            List<StageConfig> optimizingStages,
-            float[] originalAllocation,
-            int n,
-            float totalDv)
+            float[] originalAllocation, int n, float totalDv)
         {
             yield return Clone(originalAllocation);
 
@@ -164,50 +297,16 @@ namespace ShipEngineOptimization
             yield return descending;
         }
 
-        private static float EvaluateAllocation(
-            List<StageConfig> optimizingStages,
-            float[] allocation,
-            Func<List<StageConfig>, float> evaluate,
-            Dictionary<string, float> objectiveCache)
+        private static ulong AllocationKey(float[] allocation)
         {
-            string key = AllocationKey(allocation);
-            float cached;
-            if (objectiveCache.TryGetValue(key, out cached))
+            // FNV-1a over the millimetre-quantized allocation: no allocations, no formatting costs.
+            ulong hash = 14695981039346656037UL;
+            for (int i = 0; i < allocation.Length; i++)
             {
-                Apply(optimizingStages, allocation);
-                return cached;
+                hash ^= (ulong)(int)(allocation[i] * 1000f + 0.5f);
+                hash *= 1099511628211UL;
             }
-
-            Apply(optimizingStages, allocation);
-            float weight = evaluate(optimizingStages);
-            objectiveCache[key] = weight;
-            return weight;
-        }
-
-        private static float EvaluatePairMember(
-            List<StageConfig> optimizingStages,
-            float[] current,
-            int pair,
-            float pairTotal,
-            float firstStageDv,
-            Func<List<StageConfig>, float> evaluate,
-            Dictionary<string, float> objectiveCache)
-        {
-            float savedLeft = current[pair];
-            float savedRight = current[pair + 1];
-            current[pair] = Clamp(firstStageDv, MinStageDv, pairTotal - MinStageDv);
-            current[pair + 1] = pairTotal - current[pair];
-
-            float weight = EvaluateAllocation(optimizingStages, current, evaluate, objectiveCache);
-
-            current[pair] = savedLeft;
-            current[pair + 1] = savedRight;
-            return weight;
-        }
-
-        private static string AllocationKey(float[] allocation)
-        {
-            return string.Join(",", allocation.Select(x => x.ToString("F3", CultureInfo.InvariantCulture)));
+            return hash;
         }
 
         private static void Apply(List<StageConfig> optimizingStages, float[] allocation)

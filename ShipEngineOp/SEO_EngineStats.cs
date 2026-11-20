@@ -45,7 +45,7 @@ namespace ShipEngineOptimization
             planetNameStr = planetInput;
             surfaceGravity = (float)(planet.gravParameter / (planet.Radius * planet.Radius));
             altitude = (float)planet.atmosphereDepth;
-            SEO_OptimizationCache.ClearEngineCache();
+            SEO_OptimizationCache.InvalidateSelections();
         }
 
         public void SetEngineData(string nameInput)
@@ -123,7 +123,9 @@ namespace ShipEngineOptimization
         {
             SEO_OptimizationCache.EnginePerformance cached;
             float atm = SEO_OptimizationCache.GetAtmosphere(planetNameStr, altitude);
-            if (SEO_OptimizationCache.TryGetEngine(engineName, engineData.internalName, atm, engineData.modeIdx, out cached))
+            int engineId = SEO_OptimizationCache.GetEngineId(engineName);
+            int atmBucket = SEO_OptimizationCache.QuantizeAtmosphere(atm);
+            if (SEO_OptimizationCache.TryGetEngine(engineId, atmBucket, engineData.modeIdx, out cached))
             {
                 realIsp = cached.Isp;
                 realThrust = cached.Thrust;
@@ -151,7 +153,7 @@ namespace ShipEngineOptimization
                     realIsp = engineModule.atmosphereCurve.Evaluate(atm);
                 }
                 realThrust = engineData.thrust * (realIsp / engineData.isp);
-                SEO_OptimizationCache.StoreEngine(engineName, engineData.internalName, atm, engineData.modeIdx, realIsp, realThrust);
+                SEO_OptimizationCache.StoreEngine(engineId, atmBucket, engineData.modeIdx, realIsp, realThrust);
             }
             else if (SEO_Main.realFuelsInstalled)
             { SetIspAndThrustRF(part, engineData.thrust, atm, engineData.modeIdx); }
@@ -192,7 +194,7 @@ namespace ShipEngineOptimization
                 realIsp = newAtmoCurve.Evaluate(atm);
             }
             realThrust = maxThrust * realIsp / maxIsp;
-            if (maxIsp > 0f) SEO_OptimizationCache.StoreEngine(engineName, part.name, atm, modeIdx, realIsp, realThrust);
+            if (maxIsp > 0f) SEO_OptimizationCache.StoreEngine(SEO_OptimizationCache.GetEngineId(engineName), SEO_OptimizationCache.QuantizeAtmosphere(atm), modeIdx, realIsp, realThrust);
         }
         //void SetIspAndThrust()
         //{

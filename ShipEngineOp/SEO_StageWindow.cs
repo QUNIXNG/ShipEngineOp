@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using KSP.Localization;
@@ -18,6 +19,12 @@ namespace ShipEngineOptimization
 
         //public static int selectedStageIndex;
         public static StageConfig selectedStageForEngine;
+
+        // Long-running optimizer state: the UI shows progress instead of freezing mid-click.
+        public static bool operationRunning;
+        public static float optimizationProgress;
+        public static bool optimizationCancelled;
+        public static string operationLabel = string.Empty;
         public static StageConfig selectedStageForPlanet;
         //static int division = 7;
 
@@ -57,8 +64,8 @@ namespace ShipEngineOptimization
 
             SEO_Main.PayloadInput();
 
-            float totalDv = stageList.Select(m => m.trueDv).Sum();
-            float totalMass = GetTotalWeight(stageList);
+            float totalDv = CachedTotalDv();
+            float totalMass = CachedTotalMass();
 
             GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_stageWindow_totalDv") + totalDv.ToString("F0") + " " + Localizer.Format("#LOC_SHIPENGOP_units_metersPerSecond"));
             GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_shipSpecs_totalMass") + (totalMass == float.MaxValue ? Localizer.Format("#LOC_SHIPENGOP_infinity") : (totalMass.ToString("G3")  + " " + Localizer.Format("#LOC_SHIPENGOP_units_tons"))));
@@ -66,82 +73,9 @@ namespace ShipEngineOptimization
         //PSO staging
             if (GUILayout.Button(new GUIContent(Localizer.Format("#LOC_SHIPENGOP_stageWindow_optimizeStaging"), Localizer.Format("#LOC_SHIPENGOP_tooltips_optimizingStages"))))
             {
-                List<StageConfig> optimizingStages = stageList.Where(s => s.includeInOp).ToList();
-                if (optimizingStages.Count > 1)
-                {
-                    totalDv = optimizingStages.Sum(s => s.targetDv);
-                    foreach (StageConfig stage in optimizingStages)
-                    {
-                        stage.constrainOp = 0;
-                        if (stage != optimizingStages.First())
-                        {
-                            stage.targetTwr = optimizingStages.First().targetTwr;
-                            stage.SetPlanet(optimizingStages.First().planetNameStr);
-                            stage.altitude = optimizingStages.First().altitude;
-                        }
-                    }
-
-                    float lastTotalWeight = float.MaxValue;
-                    List<float> lastDvList = new List<float>();
-                    List<StageConfig> lastStageList = stageList.ToList();
-
-                    for (int i = 1; i <= optimizingStages.Count; i++)
-                    {
-                        foreach (StageConfig stage in optimizingStages)
-                        {
-                            if (stage != optimizingStages.First())
-                            { stage.targetDv = 0; }
-                            else
-                            { stage.targetDv = totalDv; }
-                        }
-
-                        List<StageConfig> mockStageList = stageList.ToList();
-                        List<StageConfig> mockOptimizingStages = optimizingStages.ToList();
-
-                        foreach (StageConfig stage in optimizingStages)
-                        {
-                            if (optimizingStages.IndexOf(stage) >= i)
-                            {
-                                mockOptimizingStages.Remove(stage);
-                                mockStageList.Remove(stage);
-                                //Debug.Log("Deleted 1 stage");
-                            }
-                        }
-                        //Debug.Log($"1 iteration, {mockStageList.Count()} stages");
-                        //mockOptimizingStages.RemoveRange(mockOptimizingStages.Count - i, i);
-                        //foreach (StageConfig stage in optimizingStages)
-                        //{
-                        //    if (!mockOptimizingStages.Contains(stage))
-                        //    { mockStageList.Remove(stage); }
-                        //}
-
-                        if (mockOptimizingStages.Count > 1)
-                        { PsoSelectedStages(mockOptimizingStages, mockStageList); }
-
-                        float newTotalWeight = GetTotalWeight(mockStageList);
-                        //Debug.Log($"Total weight obtained {newTotalWeight:F6}");
-
-                        if (newTotalWeight >= lastTotalWeight && lastTotalWeight != float.MaxValue)
-                        {
-                            //Debug.Log($"new total weight {newTotalWeight:G3}, last total weight {lastTotalWeight:G3}");
-                            stageList = lastStageList.ToList();
-                            for (i = 0; i < stageList.Count(); i++)
-                            { stageList[i].targetDv = lastDvList[i]; }
-                            Debug.Log(string.Join(", ", lastDvList));
-                            break;
-                        }
-                        else
-                        {
-                            //Debug.Log("1 iteration");
-                            lastTotalWeight = newTotalWeight;
-                            lastStageList = mockStageList.ToList();
-                            lastDvList = lastStageList.Select(s => s.targetDv).ToList();
-                        }
-                    }
-                    //PsoSelectedStages(optimizingStages, stageList);
-                }
+                StartOptimization(CoOptimizeSelectedStages());
             }
-            GUILayout.Box( Localizer.Format("#LOC_SHIPENGOP_stageWindow_selectedStages") + " " + string.Join(Localizer.Format("#LOC_SHIPENGOP_joint"), stageList.Where(s => s.includeInOp).Select(s => stageList.IndexOf(s))) );
+            GUILayout.Box( Localizer.Format("#LOC_SHIPENGOP_stageWindow_selectedStages") + " " + CachedSelectedStageList() );
 
             //division = Mathf.RoundToInt(GUILayout.HorizontalSlider(division, 1, 10));
 
@@ -272,52 +206,7 @@ namespace ShipEngineOptimization
             //Split stage
                 if (GUILayout.Button(new GUIContent(Localizer.Format("#LOC_SHIPENGOP_stageWindow_splitStage"), Localizer.Format("#LOC_SHIPENGOP_tooltips_automaticSplit")), GUILayout.Width(100), GUILayout.Height(60)))
                 {
-                    stage.keepEngine = false;
-                    stage.constrainOp = 0;
-                    stage.GetBestEngine();
-
-                    float startingPayload = stage.payloadMass;
-                    float stageTotalDv = stage.targetDv;
-
-                    List<StageConfig> splitStageList = new List<StageConfig> { stage };
-                    float newTotalWeight = stage.stageWeight;
-                    float lastTotalWeight = float.MaxValue;
-                    List<StageConfig> lastStageList = splitStageList.ToList();
-                    List<float> lastDvList = lastStageList.Select(s => s.targetDv).ToList();
-
-                    while (newTotalWeight < lastTotalWeight || newTotalWeight == float.MaxValue)
-                    {
-                        lastTotalWeight = newTotalWeight;
-                        lastStageList = splitStageList.ToList();
-                        lastDvList = lastStageList.Select(s => s.targetDv).ToList();
-
-                        splitStageList.Insert(0, stage.CloneStageWithPayload(startingPayload));
-                        PsoSelectedStages(splitStageList, splitStageList);
-                        newTotalWeight = GetTotalWeight(splitStageList);
-                    }
-
-                    lastStageList.First().payloadMass = startingPayload;
-
-                    if (lastStageList.Count > 1)
-                    {
-                        for (int i = 0; i < lastStageList.Count; i++)
-                        { lastStageList[i].targetDv = lastDvList[i]; }
-                        lastStageList.Remove(stage);
-                        stageList.InsertRange(stageList.IndexOf(stage), lastStageList);
-                    }
-                    else
-                    {
-                        stage.payloadMass = startingPayload;
-                        stage.targetDv = lastDvList.Last();
-                    }
-
-                    //debug
-                    //Debug.Log("Split stage into " + lastStageList.Count());
-                    //Debug.Log("dv distribution: " + string.Join(" ", lastDvList));
-                    //stage.payloadMass = startingPayload;
-                    //stage.targetDv = stageTotalDv;
-                    splitStageList.Clear();
-                    lastStageList.Clear();
+                    StartOptimization(CoSplitSelectedStage(stage));
                 }
                             GUILayout.EndVertical(); // End right side column 2
                 
@@ -511,6 +400,196 @@ namespace ShipEngineOptimization
         //    return (optimalDv,  minTotalMass);
         //}
 
+        /// <summary>Runs a long operation on the addon so it spans frames instead of freezing the editor.</summary>
+        public static void StartOptimization(IEnumerator routine)
+        {
+            if (operationRunning || routine == null) return;
+
+            if (SEO_Main.instance == null)
+            {
+                Debug.LogWarning("[ShipEngineOp] No host addon available; running the optimization inline.");
+                while (routine.MoveNext()) { }
+                cachedSignature = int.MinValue;
+                return;
+            }
+
+            operationRunning = true;
+            optimizationCancelled = false;
+            optimizationProgress = 0f;
+            SEO_Main.instance.StartCoroutine(CoRunOperation(routine));
+        }
+
+        private static IEnumerator CoRunOperation(IEnumerator routine)
+        {
+            yield return SEO_Main.instance.StartCoroutine(routine);
+            operationRunning = false;
+            optimizationCancelled = false;
+            optimizationProgress = 1f;
+            operationLabel = string.Empty;
+            cachedSignature = int.MinValue;
+            RefreshStageSummaryCache();
+        }
+
+        /// <summary>Auto-optimize every stage marked "include in optimization".</summary>
+        private static IEnumerator CoOptimizeSelectedStages()
+        {
+            operationLabel = Localizer.Format("#LOC_SHIPENGOP_stageWindow_optimizeStaging");
+            yield return null;
+
+            List<StageConfig> optimizingStages = stageList.Where(s => s.includeInOp).ToList();
+            if (optimizingStages.Count <= 1) yield break;
+
+            float totalDv = optimizingStages.Sum(s => s.targetDv);
+            foreach (StageConfig stage in optimizingStages)
+            {
+                stage.constrainOp = 0;
+                if (stage != optimizingStages.First())
+                {
+                    stage.targetTwr = optimizingStages.First().targetTwr;
+                    stage.SetPlanet(optimizingStages.First().planetNameStr);
+                    stage.altitude = optimizingStages.First().altitude;
+                }
+            }
+
+            float lastTotalWeight = float.MaxValue;
+            List<float> lastDvList = new List<float>();
+            List<StageConfig> lastStageList = stageList.ToList();
+
+            for (int i = 1; i <= optimizingStages.Count; i++)
+            {
+                if (optimizationCancelled) yield break;
+
+                foreach (StageConfig stage in optimizingStages)
+                {
+                    if (stage != optimizingStages.First())
+                    { stage.targetDv = 0; }
+                    else
+                    { stage.targetDv = totalDv; }
+                }
+
+                List<StageConfig> mockStageList = stageList.ToList();
+                List<StageConfig> mockOptimizingStages = optimizingStages.ToList();
+
+                foreach (StageConfig stage in optimizingStages)
+                {
+                    if (optimizingStages.IndexOf(stage) >= i)
+                    {
+                        mockOptimizingStages.Remove(stage);
+                        mockStageList.Remove(stage);
+                    }
+                }
+
+                if (mockOptimizingStages.Count > 1)
+                {
+                    float mockTotalDv = mockOptimizingStages.Sum(s => s.targetDv);
+                    yield return CoOptimizeStages(mockOptimizingStages, mockStageList, mockTotalDv);
+                    if (optimizationCancelled) yield break;
+                }
+
+                float newTotalWeight = GetTotalWeight(mockStageList);
+
+                if (newTotalWeight >= lastTotalWeight && lastTotalWeight != float.MaxValue)
+                {
+                    stageList = lastStageList.ToList();
+                    for (i = 0; i < stageList.Count(); i++)
+                    { stageList[i].targetDv = lastDvList[i]; }
+                    break;
+                }
+                else
+                {
+                    lastTotalWeight = newTotalWeight;
+                    lastStageList = mockStageList.ToList();
+                    lastDvList = lastStageList.Select(s => s.targetDv).ToList();
+                }
+
+                yield return null;
+            }
+        }
+
+        /// <summary>Split the chosen stage as often as it keeps lowering the vessel mass.</summary>
+        private static IEnumerator CoSplitSelectedStage(StageConfig stage)
+        {
+            operationLabel = Localizer.Format("#LOC_SHIPENGOP_stageWindow_splitStage");
+            yield return null;
+
+            stage.keepEngine = false;
+            stage.constrainOp = 0;
+            stage.GetBestEngine();
+
+            float startingPayload = stage.payloadMass;
+
+            List<StageConfig> splitStageList = new List<StageConfig> { stage };
+            float newTotalWeight = stage.stageWeight;
+            float lastTotalWeight = float.MaxValue;
+            List<StageConfig> lastStageList = splitStageList.ToList();
+            List<float> lastDvList = lastStageList.Select(s => s.targetDv).ToList();
+
+            while (newTotalWeight < lastTotalWeight || newTotalWeight == float.MaxValue)
+            {
+                if (optimizationCancelled) yield break;
+
+                lastTotalWeight = newTotalWeight;
+                lastStageList = splitStageList.ToList();
+                lastDvList = lastStageList.Select(s => s.targetDv).ToList();
+
+                splitStageList.Insert(0, stage.CloneStageWithPayload(startingPayload));
+                float splitTotalDv = splitStageList.Sum(s => s.targetDv);
+                yield return CoOptimizeStages(splitStageList, splitStageList, splitTotalDv);
+                if (optimizationCancelled) yield break;
+
+                newTotalWeight = GetTotalWeight(splitStageList);
+            }
+
+            lastStageList.First().payloadMass = startingPayload;
+
+            if (lastStageList.Count > 1)
+            {
+                for (int i = 0; i < lastStageList.Count; i++)
+                { lastStageList[i].targetDv = lastDvList[i]; }
+                lastStageList.Remove(stage);
+                stageList.InsertRange(stageList.IndexOf(stage), lastStageList);
+            }
+            else
+            {
+                stage.payloadMass = startingPayload;
+                stage.targetDv = lastDvList.Last();
+            }
+
+            splitStageList.Clear();
+            lastStageList.Clear();
+        }
+
+        /// <summary>Localized label with a plain-text fallback when the tag is missing.</summary>
+        private static string CancelLabel()
+        {
+            string text = Localizer.Format("#LOC_SHIPENGOP_cancel");
+            return string.IsNullOrEmpty(text) || text.StartsWith("#") ? "Cancel" : text;
+        }
+
+        /// <summary>Progress window shown while an optimization is running.</summary>
+        public static void DrawOperationOverlay()
+        {
+            if (!operationRunning) return;
+
+            Rect rect = new Rect((Screen.width - 320f) * 0.5f, (Screen.height - 96f) * 0.5f, 320f, 96f);
+            GUI.Window(0x5E01, rect, DrawOperationWindow, Localizer.Format("#LOC_SHIPENGOP_mainWindowTitle"));
+        }
+
+        private static void DrawOperationWindow(int id)
+        {
+            GUILayout.Space(4f);
+            GUILayout.Label(string.IsNullOrEmpty(operationLabel)
+                ? Localizer.Format("#LOC_SHIPENGOP_mainWindowTitle")
+                : operationLabel);
+            GUILayout.Label(Mathf.RoundToInt(Mathf.Clamp01(optimizationProgress) * 100f) + " %");
+            GUILayout.Space(4f);
+            if (GUILayout.Button(CancelLabel()))
+            {
+                optimizationCancelled = true;
+            }
+            GUI.DragWindow();
+        }
+
         public static void PsoSelectedStages(List<StageConfig> optimizingStages, List<StageConfig> mockStageList)
         {
             float totalDv = optimizingStages.Sum(s => s.targetDv);
@@ -528,6 +607,10 @@ namespace ShipEngineOptimization
             Debug.Log("Starting deterministic stage-distribution optimization...");
             Debug.Log($"Constraint: x1 + ... + x{totalVariables} = {totalDv:F2}");
             Debug.Log("--------------------------------------------------");
+
+            // A run starts from a clean slate: engine ranking depends on fuel filter, blacklist
+            // and extra mass, which are fixed while the optimizer is running.
+            SEO_OptimizationCache.InvalidateSelections();
 
             float[] optimizedAllocation;
             try
@@ -547,7 +630,54 @@ namespace ShipEngineOptimization
             }
 
             Debug.Log("Optimization complete.");
+            ApplyOptimizedAllocation(optimizingStages, mockStageList, optimizedAllocation, totalDv);
+        }
 
+        /// <summary>
+        /// Incremental variant used by the editor UI: the search is advanced a bit per frame so the
+        /// game keeps rendering a progress bar instead of locking up.
+        /// </summary>
+        public static IEnumerator CoOptimizeStages(
+            List<StageConfig> optimizingStages, List<StageConfig> mockStageList, float totalDv)
+        {
+            SEO_OptimizationCache.InvalidateSelections();
+
+            AutoStageOptimizer.Run run = null;
+            try
+            {
+                run = new AutoStageOptimizer.Run(optimizingStages, stages => GetTotalWeight(mockStageList));
+            }
+            catch (Exception optimizerException)
+            {
+                Debug.LogWarning("[ShipEngineOp] Optimizer setup failed; running synchronously. " + optimizerException);
+            }
+
+            if (run != null)
+            {
+                while (!run.Finished)
+                {
+                    if (optimizationCancelled) { yield break; }
+                    run.Step(400);
+                    optimizationProgress = run.Progress;
+                    yield return null;
+                }
+            }
+
+            float[] allocation = run != null ? run.Best : null;
+            if (allocation == null)
+            {
+                PsoSelectedStages(optimizingStages, mockStageList);
+                yield break;
+            }
+
+            ApplyOptimizedAllocation(optimizingStages, mockStageList, allocation, totalDv);
+        }
+
+        /// <summary>Turns a raw Δv allocation into per-stage integers and tidies up the result.</summary>
+        private static void ApplyOptimizedAllocation(
+            List<StageConfig> optimizingStages, List<StageConfig> mockStageList,
+            float[] optimizedAllocation, float totalDv)
+        {
             for (int i = 0; i < optimizedAllocation.Length; i++)
                 optimizingStages[i].targetDv = optimizedAllocation[i];
             GetTotalWeight(mockStageList);
@@ -578,8 +708,166 @@ namespace ShipEngineOptimization
             lastStage.targetDv = Math.Max(0f, totalDv - sumOfIndependent);
             GetTotalWeight(mockStageList);
 
+            // Rounding above can leave the allocation slightly suboptimal, and a shortfall on the
+            // last stage silently trims total dv. Move whole m/s between neighbouring stages while
+            // that still lowers the vessel mass, then finish by making the sum exact.
+            RefineIntegerAllocation(optimizingStages, mockStageList, totalDv);
+
             for (int i = 0; i < optimizingStages.Count; i++)
                 Debug.Log($"Optimal x{i + 1}: {optimizingStages[i].targetDv:F2}");
+        }
+
+        private static void RefineIntegerAllocation(
+            List<StageConfig> optimizingStages, List<StageConfig> mockStageList, float totalDv)
+        {
+            const float MinStageDv = 1f;
+            const int MaxRefinePasses = 8;
+
+            if (optimizingStages.Count < 2) return;
+
+            float currentWeight = GetTotalWeight(mockStageList);
+            if (currentWeight >= float.MaxValue) return;
+
+            for (int pass = 0; pass < MaxRefinePasses; pass++)
+            {
+                bool improved = false;
+
+                for (int i = 0; i < optimizingStages.Count - 1; i++)
+                {
+                    StageConfig left = optimizingStages[i];
+                    StageConfig right = optimizingStages[i + 1];
+                    if (left.targetDv <= MinStageDv) continue;
+
+                    float savedLeft = left.targetDv;
+                    float savedRight = right.targetDv;
+
+                    left.targetDv = savedLeft - 1f;
+                    right.targetDv = savedRight + 1f;
+                    float shifted = GetTotalWeight(mockStageList);
+
+                    if (shifted < currentWeight)
+                    {
+                        currentWeight = shifted;
+                        improved = true;
+                        continue;
+                    }
+
+                    left.targetDv = savedLeft + 1f;
+                    right.targetDv = savedRight - 1f;
+                    if (right.targetDv >= MinStageDv)
+                    {
+                        shifted = GetTotalWeight(mockStageList);
+                        if (shifted < currentWeight)
+                        {
+                            currentWeight = shifted;
+                            improved = true;
+                            continue;
+                        }
+                    }
+
+                    left.targetDv = savedLeft;
+                    right.targetDv = savedRight;
+                    GetTotalWeight(mockStageList);
+                }
+
+                if (!improved) break;
+            }
+
+            // Make the total exact: any leftover goes to the last stage, any overshoot is taken
+            // back from it first and then from the stages above.
+            float sum = 0f;
+            for (int i = 0; i < optimizingStages.Count - 1; i++) sum += optimizingStages[i].targetDv;
+
+            float lastDv = totalDv - sum;
+            if (lastDv >= MinStageDv)
+            {
+                optimizingStages[optimizingStages.Count - 1].targetDv = lastDv;
+            }
+            else
+            {
+                float excess = MinStageDv - lastDv;
+                for (int i = optimizingStages.Count - 2; i >= 0 && excess > 0f; i--)
+                {
+                    float take = Mathf.Min(excess, optimizingStages[i].targetDv - MinStageDv);
+                    if (take <= 0f) continue;
+                    optimizingStages[i].targetDv -= take;
+                    excess -= take;
+                }
+                optimizingStages[optimizingStages.Count - 1].targetDv = MinStageDv;
+            }
+
+            GetTotalWeight(mockStageList);
+        }
+
+        private static int cachedSignature = int.MinValue;
+        private static float cachedMass = float.MaxValue;
+        private static float cachedDv;
+        private static string cachedSelectedStages = string.Empty;
+
+        /// <summary>
+        /// OnGUI runs several times per frame; recomputing the vessel mass means a full engine
+        /// re-selection for every stage, so only redo it when an input actually changed.
+        /// </summary>
+        private static int ComputeStageSignature()
+        {
+            unchecked
+            {
+                int hash = 17;
+                hash = hash * 31 + SEO_OptimizationCache.Version;
+                hash = hash * 31 + stageList.Count;
+
+                for (int i = 0; i < stageList.Count; i++)
+                {
+                    StageConfig stage = stageList[i];
+                    hash = hash * 31 + stage.targetDv.GetHashCode();
+                    hash = hash * 31 + stage.trueDv.GetHashCode();
+                    hash = hash * 31 + stage.targetTwr.GetHashCode();
+                    hash = hash * 31 + stage.payloadMass.GetHashCode();
+                    hash = hash * 31 + stage.additionalMass.GetHashCode();
+                    hash = hash * 31 + stage.altitude.GetHashCode();
+                    hash = hash * 31 + stage.constrainOp;
+                    hash = hash * 31 + stage.qtyFilter;
+                    hash = hash * 31 + (stage.manualMode ? 1 : 0);
+                    hash = hash * 31 + (stage.keepEngine ? 2 : 0);
+                    hash = hash * 31 + (stage.includeInOp ? 4 : 0);
+                    hash = hash * 31 + (stage.filterT ? 8 : 0);
+                    hash = hash * 31 + (stage.planetNameStr != null ? stage.planetNameStr.GetHashCode() : 0);
+                    hash = hash * 31 + (stage.engineName != null ? stage.engineName.GetHashCode() : 0);
+                }
+
+                return hash;
+            }
+        }
+
+        private static void RefreshStageSummaryCache()
+        {
+            int signature = ComputeStageSignature();
+            if (signature == cachedSignature) return;
+
+            cachedSignature = signature;
+            cachedDv = stageList.Select(m => m.trueDv).Sum();
+            cachedMass = GetTotalWeight(stageList);
+            cachedSelectedStages = string.Join(
+                Localizer.Format("#LOC_SHIPENGOP_joint"),
+                stageList.Where(s => s.includeInOp).Select(s => stageList.IndexOf(s)));
+        }
+
+        private static float CachedTotalDv()
+        {
+            RefreshStageSummaryCache();
+            return cachedDv;
+        }
+
+        private static float CachedTotalMass()
+        {
+            RefreshStageSummaryCache();
+            return cachedMass;
+        }
+
+        private static string CachedSelectedStageList()
+        {
+            RefreshStageSummaryCache();
+            return cachedSelectedStages;
         }
 
         public static float GetTotalWeight(List<StageConfig> mockStages)
