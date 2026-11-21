@@ -23,6 +23,7 @@ namespace ShipEngineOptimization
 
         public float altitude { get; set; }
         public string planetNameStr { get; set; }
+
         public int constrainOp = 0; // 0 = constrain dv; 1 = constrain twr
         public int qtyFilter = 9;
         public bool filterT = false;
@@ -30,6 +31,14 @@ namespace ShipEngineOptimization
         public bool manualMode = false;
         public bool keepEngine = false;
         public bool includeInOp = false;
+        /// <summary>Use vacuum isp / TWR for this stage instead of sea level.</summary>
+        public bool useVacuum = true;
+        /// <summary>Keep the engine that is already on this stage; only its delta-v is optimised.</summary>
+        public bool lockEngine = false;
+        /// <summary>Keep this stage's own TWR target even when per-stage TWR is switched off.</summary>
+        public bool lockTwr = false;
+        /// <summary>Payload this stage carries, measured from the craft; never overwritten by the chain.</summary>
+        public float ownPayloadMass;
 
         // output
         public string engineName;
@@ -154,6 +163,8 @@ namespace ShipEngineOptimization
         private (string Name, float weight, float wdr, float weightTotal, float twr, float dv, float fuelMass, int qtyEng)
             GetBestEngineSelection(float truePayload, float atm)
         {
+            SEO_StageWindow.EnsureDefaultFuelSelection();
+
             SEO_OptimizationCache.Selection cached;
             if (SEO_OptimizationCache.TryGetSelection(atm, truePayload, targetDv, targetTwr, constrainOp, filterT, qtyFilter, out cached))
             {
@@ -352,22 +363,65 @@ namespace ShipEngineOptimization
             return engineModuleRF.atmCurveIsp.Evaluate(atm);
         }
 
+        /// <summary>
+        /// Wet mass of this stage (payload included) for a given delta-v allocation.
+        ///
+        /// Derived from the rocket equation with the tank mass folded in: a stage whose tanks
+        /// hold `wdr` times their own dry mass gets, with a = 1/(wdr-1),
+        ///     R = exp(dv / (g0 * isp))            mass ratio of the stage
+        ///     F = (P + E) (R - 1) / (1 - R a)     propellant mass
+        ///     W = (P + E) R (1 - a) / (1 - R a)   wet mass, payload P and engines E included
+        /// R a >= 1 means the stage cannot physically hold that much delta-v, so it is rejected
+        /// instead of producing a division blow-up.
+        /// </summary>
         float GetWeightTotal(float weightEng, float thrust, float isp, float wdr, float payload, float dv, float twr)
         {
-            if (twr > thrust / (weightEng * surfaceGravity) || dv >= SEO_Main.DvLimit(weightEng, thrust, isp, wdr, twr, surfaceGravity))
-            { return float.MaxValue; }
+            if (weightEng <= 0f || thrust <= 0f || isp <= 0f) return float.MaxValue;
+            if (wdr <= 1.001f) return float.MaxValue;
+            if (payload <= 0f) return float.MaxValue;
 
-            int qtyEng = GetEngQty(weightEng, thrust, isp, wdr, payload, dv, twr);
-
-            switch (constrainOp)
+            if (constrainOp == 1)
             {
-                default: // constrain dv
-                    float e = Mathf.Exp(dv / (SEO_Main.standardGravity * isp));
-                    float weightTotal = (payload + qtyEng * weightEng) * (1 + (1 - e) / (e / wdr - 1));
-                    return weightTotal;
-                case 1: // constrain TWR
-                    return thrust * qtyEng / (twr * surfaceGravity);
+                // Constrain TWR: pick the engine count the thrust requirement dictates.
+                if (twr <= 0f) return float.MaxValue;
+                float neededThrust = twr * payload * surfaceGravity;
+                int qty = Mathf.Max(1, Mathf.CeilToInt(neededThrust / thrust));
+                for (int i = 0; i < 6; i++)
+                {
+                    float w = payload + qty * weightEng;
+                    int next = Mathf.Max(1, Mathf.CeilToInt((twr * w * surfaceGravity) / thrust));
+                    if (next == qty) break;
+                    qty = next;
+                }
+                return payload + qty * weightEng;
             }
+
+            float a = 1f / (wdr - 1f);
+            float R = Mathf.Exp(dv / (SEO_Main.standardGravity * isp));
+            if (float.IsNaN(R) || float.IsInfinity(R) || R * a >= 0.999f) return float.MaxValue;
+
+            // Engine count follows from the TWR constraint, but the wet mass depends on it,
+            // so settle the two together.
+            int engines = 1;
+            float wet = float.MaxValue;
+            for (int i = 0; i < 6; i++)
+            {
+                float enginesMass = engines * weightEng;
+                float baseMass = payload + enginesMass;
+                if (baseMass <= 0f) return float.MaxValue;
+
+                wet = baseMass * R * (1f - a) / (1f - R * a);
+                if (float.IsNaN(wet) || float.IsInfinity(wet) || wet <= 0f) return float.MaxValue;
+
+                if (twr <= 0f) break;
+                int needed = Mathf.Max(1, Mathf.CeilToInt((twr * wet * surfaceGravity) / thrust));
+                if (needed == engines) break;
+                engines = needed;
+            }
+
+            // Final check: the stage must actually be able to lift itself off at the wanted TWR.
+            if (twr > 0f && thrust * engines / (wet * surfaceGravity) + 1e-3f < twr) return float.MaxValue;
+            return wet;
         }
 
         int GetEngQty(float weightEng, float thrust, float isp, float wdr, float payload, float dv, float twr)

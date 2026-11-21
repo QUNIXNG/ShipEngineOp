@@ -433,6 +433,23 @@ namespace ShipEngineOptimization
             tooltip = GUI.tooltip;
         }
 
+        /// <summary>
+        /// Part unlocks only exist in career and science saves. Sandbox has everything from the start,
+        /// so the filter is a no-op there - say so instead of silently doing nothing.
+        /// </summary>
+        public static bool CareerFilterApplies()
+        {
+            if (HighLogic.CurrentGame == null) return false;
+            switch (HighLogic.CurrentGame.Mode)
+            {
+                case Game.Modes.CAREER:
+                case Game.Modes.SCIENCE_SANDBOX:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         static void RefreshEngineParts()
         {
             //bool realFuelsInstalled = AssemblyLoader.loadedAssemblies.Any(a => a.assembly.GetName().Name.Equals("RealFuels", StringComparison.OrdinalIgnoreCase));
@@ -450,7 +467,7 @@ namespace ShipEngineOptimization
 
             foreach (var part in availableParts)
             {
-                if (careerToggle && HighLogic.CurrentGame.Mode == Game.Modes.CAREER)
+                if (careerToggle && CareerFilterApplies())
                 {
                     if (!ResearchAndDevelopment.PartModelPurchased(part))
                         continue;
@@ -600,6 +617,11 @@ namespace ShipEngineOptimization
         {
             var propellantNames = GetSortedFuelType(engineModule.propellants.Select(p => p.name).Where(p => p != "ElectricCharge"));
             if (propellantNames.Contains("SolidFuel")) return;
+            // Air-breathing engines produce no vacuum thrust; they are not staging candidates.
+            if (propellantNames.Contains("IntakeAir")) return;
+            // Radial engines (no stack node) cannot carry a stage under them, so they are not candidates.
+            AvailablePart partInfo = SEO_OptimizationCache.GetPart(internalName);
+            if (partInfo != null && partInfo.partPrefab != null && !partInfo.partPrefab.attachRules.allowStack) return;
 
             if (!groupedEngines.ContainsKey(propellantNames))
             {
@@ -620,7 +642,10 @@ namespace ShipEngineOptimization
 
         static void SetEngineDataRF2(string name, float weight, ConfigNode config, string internalName, int modeIdx)
         {
-            var propellantNames = GetSortedFuelType(config.GetNodes("PROPELLANT").Select(c => c.GetValue("name")).Where(p => p != "ElectricCharge"));
+            var propellants = config.GetNodes("PROPELLANT").Select(c => c.GetValue("name")).Where(p => p != "ElectricCharge").ToList();
+            if (propellants.Any(p => p == "SolidFuel")) return;   // solid motors are never recommended
+            if (propellants.Any(p => p == "IntakeAir")) return;   // jets are never recommended
+            var propellantNames = GetSortedFuelType(propellants);
 
             //Debug.Log("[StageEngineConfig] Aquired propellant combination " + propellantNames);
             if (propellantNames.Contains("SolidFuel")) return;
@@ -712,13 +737,27 @@ namespace ShipEngineOptimization
 
         public static void ToggleCareer()
         {
-            bool newToggle = GUILayout.Toggle(careerToggle, Localizer.Format("#LOC_SHIPENGOP_common_careerToggle"));
+            bool applies = CareerFilterApplies();
+            bool newToggle;
+            if (applies)
+            {
+                newToggle = GUILayout.Toggle(careerToggle, new GUIContent(
+                    Localizer.Format("#LOC_SHIPENGOP_common_careerToggle"),
+                    Localizer.Format("#LOC_SHIPENGOP_tooltips_careerToggle")));
+            }
+            else
+            {
+                // Sandbox: everything is unlocked, filtering by purchases cannot change anything.
+                newToggle = GUILayout.Toggle(careerToggle, new GUIContent(
+                    Localizer.Format("#LOC_SHIPENGOP_careerUnavailable"),
+                    Localizer.Format("#LOC_SHIPENGOP_tooltips_careerUnavailable")));
+            }
+
             if (newToggle != careerToggle)
             {
                 careerToggle = newToggle;
-                //LoadPropWdrFromConfig();
                 RefreshEngineParts();
-                //FinalizePropellantList();
+                SEO_StageWindow.NotifyEngineDataRefreshed();
             }
         }
 
@@ -745,7 +784,7 @@ namespace ShipEngineOptimization
             {
                 if (EditorLogic.fetch != null && EditorLogic.fetch.ship != null)
                 {
-                    payload = EditorLogic.fetch.ship.GetTotalMass();
+                    payload = SEO_ShipReader.MeasurePayloadMass(EditorLogic.fetch.ship);
                 }
             }
             GUILayout.EndHorizontal();

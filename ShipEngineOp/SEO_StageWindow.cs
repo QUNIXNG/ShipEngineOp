@@ -15,6 +15,7 @@ namespace ShipEngineOptimization
         public static Vector2 scrollPosition_stages = Vector2.zero;
 
         public static HashSet<string> selectedFuelGlobal = new HashSet<string>();
+        private static bool fuelDefaultsApplied;
         public static HashSet<string> selectedFuelStage = new HashSet<string>();
 
         //public static int selectedStageIndex;
@@ -22,14 +23,182 @@ namespace ShipEngineOptimization
 
         // Long-running optimizer state: the UI shows progress instead of freezing mid-click.
         public static bool operationRunning;
+        private static Rect operationWindowRect;
         public static float optimizationProgress;
         public static bool optimizationCancelled;
         public static string operationLabel = string.Empty;
         public static StageConfig selectedStageForPlanet;
+
+        // Craft snapshot taken by "read current vessel", used for the before/after table.
+        public static List<SEO_ShipReader.StageSnapshot> currentSnapshots = new List<SEO_ShipReader.StageSnapshot>();
+        public static float currentTotalMass;
+        public static bool autoOptimize;
+        private static string autoBaseline = string.Empty;
+        private static string autoPendingSignature = string.Empty;
+        /// <summary>Total delta-v the optimizer has to distribute across the selected stages.</summary>
+        public static float targetTotalDv;
+        /// <summary>Keep each stage's own TWR target instead of copying the first stage's.</summary>
+        public static bool perStageTwr = true;
+        private static float autoPendingSince;
         //static int division = 7;
+
+        // Label/field widths are fixed so rows line up in columns instead of drifting with text length.
+        private const float labelWidth = 110f;
+        private const float valueWidth = 130f;
+        private const float inputLabelWidth = 150f;
+        private const float inputWidth = 80f;
+        private const float statLabelWidth = 96f;
+        private const float statValueWidth = 62f;
+        private static readonly Color warnColor = new Color(1f, 0.72f, 0.25f);
+
+        /// <summary>Compact "before / after" table: current craft versus the optimizer result.</summary>
+        private static void DrawComparisonTable()
+        {
+            if (currentSnapshots.Count == 0) return;
+
+            float optimizedMass = CachedTotalMass();
+            GUILayout.BeginVertical(GUI.skin.box);
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_table_stage"), GUILayout.Width(28f));
+            GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_table_dv"), GUILayout.Width(94f));
+            GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_table_twr"), GUILayout.Width(80f));
+            GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_table_mass"), GUILayout.Width(86f));
+            GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_table_engine"));
+            GUILayout.EndHorizontal();
+
+            // Topmost stage first: matches how the rocket reads from the top down.
+            for (int i = currentSnapshots.Count - 1; i >= 0; i--)
+            {
+                SEO_ShipReader.StageSnapshot snapshot = currentSnapshots[i];
+                float newDv = i < stageList.Count ? stageList[i].trueDv : 0f;
+                float newTwr = i < stageList.Count ? stageList[i].trueTwr : 0f;
+                float newMass = i < stageList.Count ? stageList[i].stageWeight : 0f;
+                string newEngine = i < stageList.Count ? stageList[i].engineName : string.Empty;
+
+                GUILayout.BeginHorizontal();
+                GUILayout.Label(i.ToString(), GUILayout.Width(28f));
+                GUILayout.Label(FormatDelta(snapshot.Dv, newDv, "F0"), GUILayout.Width(94f));
+                GUILayout.Label(FormatDelta(snapshot.Twr, newTwr, "F2"), GUILayout.Width(80f));
+                GUILayout.Label(FormatDelta(snapshot.Mass, newMass, "G3"), GUILayout.Width(86f));
+
+                if (i < stageList.Count)
+                {
+                    StageConfig row = stageList[i];
+                    // One button that shows the mode currently in force: blue = vacuum, amber = sea level.
+                    GUIContent modeContent = new GUIContent(
+                        Localizer.Format(row.useVacuum ? "#LOC_SHIPENGOP_vacuum" : "#LOC_SHIPENGOP_atmosphere"),
+                        Localizer.Format("#LOC_SHIPENGOP_tooltips_atmosphereMode"));
+                    Color previousTint = GUI.backgroundColor;
+                    GUI.backgroundColor = row.useVacuum ? vacuumTint : atmosphereTint;
+                    if (GUILayout.Button(modeContent, GUILayout.Width(64f)))
+                    {
+                        row.useVacuum = !row.useVacuum;
+                        ApplyAtmosphereMode(row, snapshot);
+                    }
+                    GUI.backgroundColor = previousTint;
+
+                    bool wantsTwrLock = GUILayout.Toggle(row.lockTwr,
+                        new GUIContent(Localizer.Format("#LOC_SHIPENGOP_lockTwr"),
+                            Localizer.Format("#LOC_SHIPENGOP_tooltips_lockTwr")), GUILayout.Width(32f));
+                    if (wantsTwrLock != row.lockTwr)
+                    {
+                        row.lockTwr = wantsTwrLock;
+                        cachedSignature = int.MinValue;
+                        autoBaseline = string.Empty;
+                    }
+                }
+
+                GUILayout.Label(EngineCell(snapshot.EngineName, newEngine), GUILayout.Width(150f));
+                GUILayout.EndHorizontal();
+            }
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_table_total"), GUILayout.Width(160f));
+            GUILayout.Label(FormatDelta(currentTotalMass, optimizedMass, "G4"));
+            GUILayout.EndHorizontal();
+
+            GUILayout.EndVertical();
+        }
+
+        /// <summary>One short line: the craft's engine, plus the recommendation only when it differs.</summary>
+        private static readonly Color vacuumTint = new Color(0.42f, 0.70f, 1f);
+        private static readonly Color atmosphereTint = new Color(1f, 0.76f, 0.38f);
+
+        private static string EngineCell(string current, string recommended)
+        {
+            string before = string.IsNullOrEmpty(current) ? "-" : Shorten(current);
+            if (string.IsNullOrEmpty(recommended) || recommended == current) return before;
+            return before + " → " + Shorten(recommended);
+        }
+
+        /// <summary>Drop the quoted suffix so long part titles fit on one row.</summary>
+        private static string Shorten(string title)
+        {
+            if (string.IsNullOrEmpty(title)) return string.Empty;
+            int cut = title.IndexOf('“');
+            if (cut < 0) cut = title.IndexOf('"');
+            string head = cut > 0 ? title.Substring(0, cut) : title;
+            return head.Length > 15 ? head.Substring(0, 15) + "…" : head;
+        }
+
+        /// <summary>Re-derive a stage's numbers for vacuum or sea-level operation.</summary>
+        private static void ApplyAtmosphereMode(StageConfig stage, SEO_ShipReader.StageSnapshot snapshot)
+        {
+            CelestialBody planet = FlightGlobals.Bodies.FirstOrDefault(b => b.bodyName == stage.planetNameStr);
+            if (planet != null)
+            {
+                stage.altitude = stage.useVacuum ? (float)planet.atmosphereDepth : 0f;
+            }
+
+            float dv = stage.useVacuum ? snapshot.Dv : (snapshot.DvAsl > 0f ? snapshot.DvAsl : snapshot.Dv);
+            float twr = stage.useVacuum ? snapshot.Twr : (snapshot.TwrAsl > 0f ? snapshot.TwrAsl : snapshot.Twr);
+            if (dv > 0f) stage.targetDv = Mathf.Max(1f, Mathf.Round(dv));
+            if (twr > 0f) stage.targetTwr = Mathf.Max(0.01f, Mathf.Round(twr * 100f) / 100f);
+
+            cachedSignature = int.MinValue;
+            autoBaseline = string.Empty;
+        }
+
+        private static string FormatDelta(float before, float after, string format)
+        {
+            if (after <= 0f || float.IsInfinity(after) || after == float.MaxValue)
+            {
+                return before.ToString(format);
+            }
+            return before.ToString(format) + " → " + after.ToString(format);
+        }
+
+        /// <summary>Cheap signature of everything the optimizer reads, used to debounce auto runs.</summary>
+        private static string InputSignature()
+        {
+            unchecked
+            {
+                int hash = SEO_OptimizationCache.Version;
+                hash = hash * 31 + SEO_Main.payload.GetHashCode();
+                for (int i = 0; i < stageList.Count; i++)
+                {
+                    StageConfig stage = stageList[i];
+                    hash = hash * 31 + stage.targetDv.GetHashCode();
+                    hash = hash * 31 + stage.targetTwr.GetHashCode();
+                    hash = hash * 31 + stage.additionalMass.GetHashCode();
+                    hash = hash * 31 + stage.constrainOp;
+                    hash = hash * 31 + stage.qtyFilter;
+                    hash = hash * 31 + i;
+                    hash = hash * 31 + (stage.filterT ? 1 : 0);
+                    hash = hash * 31 + (stage.manualMode ? 2 : 0);
+                    hash = hash * 31 + (stage.keepEngine ? 4 : 0);
+                    hash = hash * 31 + (stage.includeInOp ? 8 : 0);
+                    hash = hash * 31 + (stage.planetNameStr == null ? 0 : stage.planetNameStr.GetHashCode());
+                    hash = hash * 31 + stage.altitude.GetHashCode();
+                }
+                return hash.ToString();
+            }
+        }
 
         public static void DrawStageWindow(int windowID)
         {
+            EnsureDefaultFuelSelection();
             if (GUI.Button(new Rect(SEO_Main.StageWndRect.size.x - 17, 2, 15, 15), "X", SEO_Main.smallButton))
             {
                 SEO_Main.showStageWindow = false;
@@ -64,16 +233,95 @@ namespace ShipEngineOptimization
 
             SEO_Main.PayloadInput();
 
+            GUILayout.Label(new GUIContent(Localizer.Format("#LOC_SHIPENGOP_quickStart"), Localizer.Format("#LOC_SHIPENGOP_tooltips_quickStart")), GUILayout.Width(560f));
+
             float totalDv = CachedTotalDv();
             float totalMass = CachedTotalMass();
 
-            GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_stageWindow_totalDv") + totalDv.ToString("F0") + " " + Localizer.Format("#LOC_SHIPENGOP_units_metersPerSecond"));
-            GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_shipSpecs_totalMass") + (totalMass == float.MaxValue ? Localizer.Format("#LOC_SHIPENGOP_infinity") : (totalMass.ToString("G3")  + " " + Localizer.Format("#LOC_SHIPENGOP_units_tons"))));
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_stageWindow_totalDv"), GUILayout.Width(labelWidth));
+            GUILayout.Label(totalDv.ToString("F0") + " " + Localizer.Format("#LOC_SHIPENGOP_units_metersPerSecond"), GUILayout.Width(valueWidth));
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_shipSpecs_totalMass"), GUILayout.Width(labelWidth));
+            GUILayout.Label(totalMass == float.MaxValue ? Localizer.Format("#LOC_SHIPENGOP_infinity") : (totalMass.ToString("G3") + " " + Localizer.Format("#LOC_SHIPENGOP_units_tons")), GUILayout.Width(valueWidth));
+            GUILayout.EndHorizontal();
 
         //PSO staging
             if (GUILayout.Button(new GUIContent(Localizer.Format("#LOC_SHIPENGOP_stageWindow_optimizeStaging"), Localizer.Format("#LOC_SHIPENGOP_tooltips_optimizingStages"))))
             {
                 StartOptimization(CoOptimizeSelectedStages());
+            }
+
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button(new GUIContent(Localizer.Format("#LOC_SHIPENGOP_readVessel"), Localizer.Format("#LOC_SHIPENGOP_tooltips_readVessel"))))
+            {
+                float payload;
+                float total;
+                if (SEO_ShipReader.TryRead(currentSnapshots, out payload, out total) &&
+                    SEO_ShipReader.ApplyToStageList(currentSnapshots, payload))
+                {
+                    currentTotalMass = total;
+                    targetTotalDv = stageList.Sum(stage => stage.targetDv);
+                    cachedSignature = int.MinValue;
+                    autoBaseline = string.Empty;
+                }
+            }
+            autoOptimize = GUILayout.Toggle(autoOptimize, new GUIContent(Localizer.Format("#LOC_SHIPENGOP_autoOptimize"), Localizer.Format("#LOC_SHIPENGOP_tooltips_autoOptimize")));
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(new GUIContent(Localizer.Format("#LOC_SHIPENGOP_totalDvTarget"), Localizer.Format("#LOC_SHIPENGOP_tooltips_totalDvTarget")), GUILayout.Width(labelWidth));
+            string dvField = GUILayout.TextField(targetTotalDv <= 0f ? string.Empty : targetTotalDv.ToString("F0"), 7, GUILayout.Width(inputWidth));
+            float parsedTotalDv;
+            if (float.TryParse(dvField, out parsedTotalDv) && parsedTotalDv > 0f) targetTotalDv = parsedTotalDv;
+            if (GUILayout.Button(Localizer.Format("#LOC_SHIPENGOP_useCraftDv")))
+            {
+                targetTotalDv = stageList.Sum(stage => stage.trueDv > 0f ? stage.trueDv : stage.targetDv);
+                cachedSignature = int.MinValue;
+                autoBaseline = string.Empty;
+            }
+            bool perStageTwrNow = GUILayout.Toggle(perStageTwr,
+                new GUIContent(Localizer.Format("#LOC_SHIPENGOP_perStageTwr"), Localizer.Format("#LOC_SHIPENGOP_tooltips_perStageTwr")));
+            if (perStageTwrNow != perStageTwr)
+            {
+                perStageTwr = perStageTwrNow;
+                cachedSignature = int.MinValue;
+                autoBaseline = string.Empty;
+            }
+            GUILayout.EndHorizontal();
+
+            DrawComparisonTable();
+
+            if (autoOptimize && !operationRunning && stageList.Count > 1)
+            {
+                string now = InputSignature();
+                if (autoBaseline.Length == 0)
+                {
+                    autoBaseline = now;
+                    autoPendingSignature = string.Empty;
+                }
+                else if (now != autoBaseline)
+                {
+                    // Wait until the inputs stop changing: dragging a slider or typing a value
+                    // would otherwise restart the run every frame.
+                    if (now != autoPendingSignature)
+                    {
+                        autoPendingSignature = now;
+                        autoPendingSince = Time.realtimeSinceStartup;
+                    }
+                    else if (Time.realtimeSinceStartup - autoPendingSince > 0.35f)
+                    {
+                        autoBaseline = now;
+                        autoPendingSignature = string.Empty;
+                        StartOptimization(CoOptimizeSelectedStages());
+                    }
+                }
+                else
+                {
+                    autoPendingSignature = string.Empty;
+                }
             }
             GUILayout.Box( Localizer.Format("#LOC_SHIPENGOP_stageWindow_selectedStages") + " " + CachedSelectedStageList() );
 
@@ -83,11 +331,11 @@ namespace ShipEngineOptimization
 
             GUILayout.EndHorizontal();
 
-            GUILayout.Space(20);
+            GUILayout.Space(6);
             GUILayout.BeginVertical();
 
         //Stage List Starts
-            scrollPosition_stages = GUILayout.BeginScrollView(scrollPosition_stages, GUILayout.Width(600), GUILayout.Height(500));
+            scrollPosition_stages = GUILayout.BeginScrollView(scrollPosition_stages, GUILayout.Width(600), GUILayout.Height(360));
 
             foreach (StageConfig stage in stageList)
             {
@@ -112,20 +360,20 @@ namespace ShipEngineOptimization
                 //stage.manualMode = GUILayout.Toggle(stage.manualMode, Localizer.Format("#LOC_SHIPENGOP_stageWindow_manualMode"));
 
                         GUILayout.BeginHorizontal();
-                GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_stageWindow_desiredDv"));
-                string targetDvStr = GUILayout.TextField(stage.targetDv.ToString("F0"), 6, GUILayout.Width(60));
+                GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_stageWindow_desiredDv"), GUILayout.Width(inputLabelWidth));
+                string targetDvStr = GUILayout.TextField(stage.targetDv.ToString("F0"), 6, GUILayout.Width(inputWidth));
                 float.TryParse(targetDvStr, out stage.targetDv);
                         GUILayout.EndHorizontal();
 
                         GUILayout.BeginHorizontal();
-                GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_stageWindow_desiredTwr"));
-                string targetTwrStr = GUILayout.TextField(stage.targetTwr.ToString("F2"), 6, GUILayout.Width(60));
+                GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_stageWindow_desiredTwr"), GUILayout.Width(inputLabelWidth));
+                string targetTwrStr = GUILayout.TextField(stage.targetTwr.ToString("F2"), 6, GUILayout.Width(inputWidth));
                 float.TryParse(targetTwrStr, out stage.targetTwr);
                         GUILayout.EndHorizontal();
 
                         GUILayout.BeginHorizontal();
-                GUILayout.Label(new GUIContent(Localizer.Format("#LOC_SHIPENGOP_stageWindow_extraMass"), Localizer.Format("#LOC_SHIPENGOP_tooltips_extraMass")));
-                string addiMassStr = GUILayout.TextField(stage.additionalMass.ToString(stage.additionalMass == 0 ? "F2" : ""), 7, GUILayout.Width(60));
+                GUILayout.Label(new GUIContent(Localizer.Format("#LOC_SHIPENGOP_stageWindow_extraMass"), Localizer.Format("#LOC_SHIPENGOP_tooltips_extraMass")), GUILayout.Width(inputLabelWidth));
+                string addiMassStr = GUILayout.TextField(stage.additionalMass.ToString(stage.additionalMass == 0 ? "F2" : ""), 7, GUILayout.Width(inputWidth));
                 float.TryParse(addiMassStr, out stage.additionalMass);
                         GUILayout.EndHorizontal();
 
@@ -148,7 +396,7 @@ namespace ShipEngineOptimization
 
                     GUILayout.EndVertical(); // End left side
 
-                GUILayout.Space(20);
+                GUILayout.Space(10);
 
                     GUILayout.BeginVertical(GUILayout.Width(320)); // Begin right side
 
@@ -184,18 +432,29 @@ namespace ShipEngineOptimization
                 else { GUILayout.Box(new GUIContent(stage.engineName, Localizer.Format("#LOC_SHIPENGOP_tooltips_stageEngineAutoMode")), SEO_Main.engineNameBox, GUILayout.Width(320)); }
 
                         GUILayout.BeginHorizontal(); // Begin right side columns
-                            GUILayout.BeginVertical(GUILayout.Width(150)); // Begin right side column 1
+                            GUILayout.BeginVertical(GUILayout.Width(160)); // Begin right side column 1
 
                 stage.strictMode = GUILayout.Toggle(stage.strictMode, new GUIContent(Localizer.Format("#LOC_SHIPENGOP_stageWindow_strictMode"), Localizer.Format("#LOC_SHIPENGOP_tooltips_strictMode")));
                 GUILayout.Space(3);
                 if (stage.stageWeight != float.MaxValue)
                 {
-                    GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_shipSpecs_engineQty") + stage.engineQty.ToString());
-                    GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_stageWindow_stageMass") + stage.stageWeight.ToString("G3") + " " + Localizer.Format("#LOC_SHIPENGOP_units_tons"));
-                    if (stage.trueTwr < stage.targetTwr || stage.trueDv < stage.targetDv) { GUI.color = Color.red; }
-                    GUILayout.Label(stage.constrainOp == 0 ?
-                        (Localizer.Format("#LOC_SHIPENGOP_shipSpecs_twr") + stage.trueTwr.ToString("F2")) :
-                        (Localizer.Format("#LOC_SHIPENGOP_shipSpecs_dv") + stage.trueDv.ToString("F0") + " " + Localizer.Format("#LOC_SHIPENGOP_units_metersPerSecond")));
+                    GUILayout.BeginHorizontal();
+                    GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_shipSpecs_engineQty"), GUILayout.Width(statLabelWidth));
+                    GUILayout.Label(stage.engineQty.ToString(), GUILayout.Width(statValueWidth));
+                    GUILayout.EndHorizontal();
+
+                    GUILayout.BeginHorizontal();
+                    GUILayout.Label(Localizer.Format("#LOC_SHIPENGOP_stageWindow_stageMass"), GUILayout.Width(statLabelWidth));
+                    GUILayout.Label(stage.stageWeight.ToString("G3") + " " + Localizer.Format("#LOC_SHIPENGOP_units_tons"), GUILayout.Width(statValueWidth));
+                    GUILayout.EndHorizontal();
+
+                    if (stage.trueTwr < stage.targetTwr || stage.trueDv < stage.targetDv) { GUI.color = warnColor; }
+                    GUILayout.BeginHorizontal();
+                    GUILayout.Label(stage.constrainOp == 0 ? Localizer.Format("#LOC_SHIPENGOP_shipSpecs_twr") : Localizer.Format("#LOC_SHIPENGOP_shipSpecs_dv"), GUILayout.Width(statLabelWidth));
+                    GUILayout.Label(stage.constrainOp == 0
+                        ? stage.trueTwr.ToString("F2")
+                        : stage.trueDv.ToString("F0") + " " + Localizer.Format("#LOC_SHIPENGOP_units_metersPerSecond"), GUILayout.Width(statValueWidth));
+                    GUILayout.EndHorizontal();
                     GUI.color = Color.white;
                 }
                             GUILayout.EndVertical(); // End right side column 1
@@ -315,6 +574,44 @@ namespace ShipEngineOptimization
             return oldConstrain;
         }
 
+        /// <summary>
+        /// Auto mode needs at least one propellant group selected. Players almost never realise that,
+        /// so preselect every usable group once instead of silently returning "no engine".
+        /// </summary>
+        /// <summary>Engine data was rebuilt (career filter, propellant ratios): drop stale fuel picks.</summary>
+        public static void NotifyEngineDataRefreshed()
+        {
+            if (SEO_Main.groupedEngines == null) return;
+
+            selectedFuelGlobal.RemoveWhere(fuel => !SEO_Main.groupedEngines.ContainsKey(fuel));
+            selectedFuelStage.RemoveWhere(fuel => !SEO_Main.groupedEngines.ContainsKey(fuel));
+
+            // If the rebuilt table invalidated every pick, fall back to selecting everything again.
+            if (selectedFuelGlobal.Count == 0) fuelDefaultsApplied = false;
+
+            cachedSignature = int.MinValue;
+            autoBaseline = string.Empty;
+        }
+
+        public static void EnsureDefaultFuelSelection()
+        {
+            if (fuelDefaultsApplied) return;
+            if (SEO_Main.groupedEngines == null || SEO_Main.groupedEngines.Count == 0) return;
+            if (SEO_Main.fuelTypes == null || SEO_Main.fuelTypes.Length == 0) return;
+
+            foreach (var fuel in SEO_Main.fuelTypes)
+            {
+                if (!SEO_Main.groupedEngines.ContainsKey(fuel)) continue;
+                string first = SEO_Main.groupedEngines[fuel].FirstOrDefault();
+                if (first == null || !SEO_Main.engineData.ContainsKey(first)) continue;
+                if (SEO_Main.engineData[first].wdr == 1f) continue;
+                if (fuel.IndexOf("IntakeAir", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                selectedFuelGlobal.Add(fuel);
+            }
+
+            fuelDefaultsApplied = true;
+        }
+
         public static HashSet<string> GetFuelFilter(HashSet<string> selectedFuelOld)
         {
 
@@ -428,6 +725,8 @@ namespace ShipEngineOptimization
             operationLabel = string.Empty;
             cachedSignature = int.MinValue;
             RefreshStageSummaryCache();
+            autoBaseline = InputSignature();   // the run itself changed targetDv; accept that as the new baseline
+            autoPendingSignature = string.Empty;
         }
 
         /// <summary>Auto-optimize every stage marked "include in optimization".</summary>
@@ -439,12 +738,15 @@ namespace ShipEngineOptimization
             List<StageConfig> optimizingStages = stageList.Where(s => s.includeInOp).ToList();
             if (optimizingStages.Count <= 1) yield break;
 
-            float totalDv = optimizingStages.Sum(s => s.targetDv);
+            float totalDv = targetTotalDv > 0f ? targetTotalDv : optimizingStages.Sum(s => s.targetDv);
+            Debug.Log(string.Format("[ShipEngineOp] optimize start stages={0} targetTotalDv={1:F1} requested={2:F1} currentSum={3:F1}",
+                optimizingStages.Count, targetTotalDv, totalDv, optimizingStages.Sum(s => s.targetDv)));
             foreach (StageConfig stage in optimizingStages)
             {
                 stage.constrainOp = 0;
-                if (stage != optimizingStages.First())
+                if (!perStageTwr && !stage.lockTwr && stage != optimizingStages.First())
                 {
+                    // Old behaviour: every stage is held to the same TWR and atmosphere as stage 0.
                     stage.targetTwr = optimizingStages.First().targetTwr;
                     stage.SetPlanet(optimizingStages.First().planetNameStr);
                     stage.altitude = optimizingStages.First().altitude;
@@ -487,6 +789,9 @@ namespace ShipEngineOptimization
                 }
 
                 float newTotalWeight = GetTotalWeight(mockStageList);
+                Debug.Log(string.Format("[ShipEngineOp] iter={0} keptStages={1} weight={2:F3} lastWeight={3:F3} dvList=[{4}]",
+                    i, mockOptimizingStages.Count, newTotalWeight, lastTotalWeight,
+                    string.Join(", ", mockStageList.Select(x => x.targetDv.ToString("F0")).ToArray())));
 
                 if (newTotalWeight >= lastTotalWeight && lastTotalWeight != float.MaxValue)
                 {
@@ -571,8 +876,12 @@ namespace ShipEngineOptimization
         {
             if (!operationRunning) return;
 
-            Rect rect = new Rect((Screen.width - 320f) * 0.5f, (Screen.height - 96f) * 0.5f, 320f, 96f);
-            GUI.Window(0x5E01, rect, DrawOperationWindow, Localizer.Format("#LOC_SHIPENGOP_mainWindowTitle"));
+            if (operationWindowRect.width < 1f)
+            {
+                operationWindowRect = new Rect((Screen.width - 320f) * 0.5f, (Screen.height - 96f) * 0.5f, 320f, 96f);
+            }
+            operationWindowRect = GUILayout.Window(0x5E01, operationWindowRect, DrawOperationWindow,
+                Localizer.Format("#LOC_SHIPENGOP_mainWindowTitle"));
         }
 
         private static void DrawOperationWindow(int id)
@@ -720,7 +1029,8 @@ namespace ShipEngineOptimization
         private static void RefineIntegerAllocation(
             List<StageConfig> optimizingStages, List<StageConfig> mockStageList, float totalDv)
         {
-            const float MinStageDv = 1f;
+            // Keep every stage above the optimizer's own floor; a 20 m/s stage is dead weight.
+            const float MinStageDv = 30f;
             const int MaxRefinePasses = 8;
 
             if (optimizingStages.Count < 2) return;
@@ -872,22 +1182,44 @@ namespace ShipEngineOptimization
 
         public static float GetTotalWeight(List<StageConfig> mockStages)
         {
-            for (int idx = 0; idx < mockStages.Count; idx ++)
+            // stageList index 0 is the stage that fires first (the bottom one), so the payload
+            // chain has to run from the top down: each stage lifts the fully loaded stage above it.
+            for (int idx = mockStages.Count - 1; idx >= 0; idx--)
             {
-                if (mockStages[idx].keepEngine)
+                if (mockStages[idx].keepEngine && idx < mockStages.Count - 1)
                 {
-                    mockStages[idx].nextStageEngineQty = mockStages[idx-1].engineQty;
-                    mockStages[idx].engineName = mockStages[idx-1].engineName;
+                    mockStages[idx].nextStageEngineQty = mockStages[idx + 1].engineQty;
+                    mockStages[idx].engineName = mockStages[idx + 1].engineName;
+                }
+
+                if (idx < mockStages.Count - 1)
+                {
+                    mockStages[idx].payloadMass = mockStages[idx + 1].stageWeight;
+                }
+                else if (mockStages[idx].ownPayloadMass > 0f)
+                {
+                    // The top stage is never fed by the chain, so make sure a previous run's
+                    // numbers cannot leak into it.
+                    mockStages[idx].payloadMass = mockStages[idx].ownPayloadMass;
                 }
 
                 mockStages[idx].GetBestEngine();
 
-                if (idx >= mockStages.Count - 1) { break; }
-                mockStages[idx + 1].payloadMass = mockStages[idx].stageWeight;
+                if (mockStages[idx].stageWeight > 1e6f)
+                {
+                    return float.MaxValue;
+                }
+
+                if (SEO_ShipReader.debugLog)
+                {
+                    Debug.Log(string.Format("[ShipEngineOp] chain idx={0} payload={1:F3} dv={2:F1} qty={3} engine={4} weight={5:F3}",
+                        idx, mockStages[idx].payloadMass, mockStages[idx].targetDv,
+                        mockStages[idx].engineQty, mockStages[idx].engineName, mockStages[idx].stageWeight));
+                }
             }
             //Debug.Log("stage 0 dv = " + stageList.First().targetDv.ToString());
             //Debug.Log("stage 0 mass = " + stageList.First().stageWeight.ToString());
-            return mockStages.Last().stageWeight;
+            return mockStages[0].stageWeight;
         }
     }
 }

@@ -10,7 +10,8 @@ namespace ShipEngineOptimization
     /// </summary>
     public static class AutoStageOptimizer
     {
-        internal const float MinStageDv = 1e-4f;
+        // A stage that only carries a few m/s is dead weight; keep every stage meaningful.
+        internal const float MinStageDv = 30f;
         private const float IntervalTolerance = 0.001f;
         private const float WeightImprovement = 1e-4f;
         private const int MaxGoldenIterations = 80;
