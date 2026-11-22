@@ -71,16 +71,18 @@ namespace ShipEngineOptimization
             for (int i = currentSnapshots.Count - 1; i >= 0; i--)
             {
                 SEO_ShipReader.StageSnapshot snapshot = currentSnapshots[i];
-                float newDv = i < stageList.Count ? stageList[i].trueDv : 0f;
-                float newTwr = i < stageList.Count ? stageList[i].trueTwr : 0f;
-                float newMass = i < stageList.Count ? stageList[i].stageWeight : 0f;
-                string newEngine = i < stageList.Count ? stageList[i].engineName : string.Empty;
+                // Only show optimised values when they still describe the current inputs.
+                bool hasResult = resultValid && i < stageList.Count;
+                float newDv = hasResult ? stageList[i].trueDv : 0f;
+                float newTwr = hasResult ? stageList[i].trueTwr : 0f;
+                float newMass = hasResult ? stageList[i].stageWeight : 0f;
+                string newEngine = hasResult ? stageList[i].engineName : string.Empty;
 
                 GUILayout.BeginHorizontal();
-                GUILayout.Label(i.ToString(), GUILayout.Width(28f));
-                GUILayout.Label(FormatDelta(snapshot.Dv, newDv, "F0"), GUILayout.Width(94f));
-                GUILayout.Label(FormatDelta(snapshot.Twr, newTwr, "F2"), GUILayout.Width(80f));
-                GUILayout.Label(FormatDelta(snapshot.Mass, newMass, "G3"), GUILayout.Width(86f));
+                GUILayout.Label(snapshot.Stage.ToString(), GUILayout.Width(28f));
+                GUILayout.Label(hasResult ? FormatDelta(snapshot.Dv, newDv, "F0") : snapshot.Dv.ToString("F0"), GUILayout.Width(94f));
+                GUILayout.Label(hasResult ? FormatDelta(snapshot.Twr, newTwr, "F2") : snapshot.Twr.ToString("F2"), GUILayout.Width(80f));
+                GUILayout.Label(hasResult ? FormatDelta(snapshot.Mass, newMass, "G3") : snapshot.Mass.ToString("G3"), GUILayout.Width(86f));
 
                 if (i < stageList.Count)
                 {
@@ -337,8 +339,10 @@ namespace ShipEngineOptimization
         //Stage List Starts
             scrollPosition_stages = GUILayout.BeginScrollView(scrollPosition_stages, GUILayout.Width(600), GUILayout.Height(360));
 
-            foreach (StageConfig stage in stageList)
+            // Draw top stage first, matching the comparison table and the rocket itself.
+            for (int drawIndex = stageList.Count - 1; drawIndex >= 0; drawIndex--)
             {
+                StageConfig stage = stageList[drawIndex];
                 GUILayout.BeginHorizontal(GUILayout.Width(580)); // Begin stage title
                 if (stageList.Count > 1)
                 {
@@ -348,7 +352,7 @@ namespace ShipEngineOptimization
                         break;
                     }
                 }
-                GUILayout.Box(Localizer.Format("#LOC_SHIPENGOP_stageWindow_stage") + stageList.IndexOf(stage).ToString());
+                GUILayout.Box(Localizer.Format("#LOC_SHIPENGOP_stageWindow_stage") + stage.kspStage);
                 GUILayout.EndHorizontal(); // End stage title
 
                 stage.payloadMass = stageList.IndexOf(stage) == 0 ? SEO_Main.payload : stageList[stageList.IndexOf(stage) - 1].stageWeight;
@@ -1022,8 +1026,16 @@ namespace ShipEngineOptimization
             // that still lowers the vessel mass, then finish by making the sum exact.
             RefineIntegerAllocation(optimizingStages, mockStageList, totalDv);
 
+            resultValid = true;
+
+            float sumTarget = 0f, sumTrue = 0f;
             for (int i = 0; i < optimizingStages.Count; i++)
-                Debug.Log($"Optimal x{i + 1}: {optimizingStages[i].targetDv:F2}");
+            {
+                sumTarget += optimizingStages[i].targetDv;
+                sumTrue += optimizingStages[i].trueDv;
+                Debug.Log($"Optimal x{i + 1}: target={optimizingStages[i].targetDv:F2} true={optimizingStages[i].trueDv:F2}");
+            }
+            Debug.Log(string.Format("[ShipEngineOp] alloc totalDv={0:F2} sumTarget={1:F2} sumTrue={2:F2}", totalDv, sumTarget, sumTrue));
         }
 
         private static void RefineIntegerAllocation(
@@ -1109,6 +1121,9 @@ namespace ShipEngineOptimization
             GetTotalWeight(mockStageList);
         }
 
+        /// <summary>False once an input changed; the optimised column is stale until the next run.</summary>
+        private static bool resultValid;
+
         private static int cachedSignature = int.MinValue;
         private static float cachedMass = float.MaxValue;
         private static float cachedDv;
@@ -1154,6 +1169,8 @@ namespace ShipEngineOptimization
             int signature = ComputeStageSignature();
             if (signature == cachedSignature) return;
 
+            // Inputs moved: whatever the table was showing no longer describes this vessel.
+            resultValid = false;
             cachedSignature = signature;
             cachedDv = stageList.Select(m => m.trueDv).Sum();
             cachedMass = GetTotalWeight(stageList);

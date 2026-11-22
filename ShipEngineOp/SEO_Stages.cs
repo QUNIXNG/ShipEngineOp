@@ -40,6 +40,9 @@ namespace ShipEngineOptimization
         /// <summary>Payload this stage carries, measured from the craft; never overwritten by the chain.</summary>
         public float ownPayloadMass;
 
+        /// <summary>Real KSP stage number for display.</summary>
+        public int kspStage;
+
         // output
         public string engineName;
         public float stageWeight;

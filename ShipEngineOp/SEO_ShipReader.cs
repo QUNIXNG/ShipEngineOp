@@ -20,6 +20,8 @@ namespace ShipEngineOptimization
         public class StageSnapshot
         {
             public int Index;
+            /// <summary>Real KSP stage number, the one shown in the stock staging list.</summary>
+            public int Stage;
             public string EngineName = string.Empty;
             public int EngineCount;
             public float Dv;
@@ -113,6 +115,7 @@ namespace ShipEngineOptimization
                 remainingMass += groupDry + groupFuel;
 
                 StageSnapshot snapshot = new StageSnapshot();
+                snapshot.Stage = group.Key;
                 snapshot.Mass = remainingMass;
                 snapshot.PropellantMass = effectiveFuel;
                 snapshot.EngineCount = engineCount;
@@ -314,6 +317,7 @@ namespace ShipEngineOptimization
 
                     StageSnapshot snapshot = new StageSnapshot();
                     snapshot.Index = found.Count;
+                    snapshot.Stage = stageIndex;
                     snapshot.Dv = dv > 0f ? dv : dvAsl;
                     snapshot.DvAsl = dvAsl;
                     snapshot.Twr = twr;
@@ -489,9 +493,9 @@ namespace ShipEngineOptimization
                     if (liquid) break;
                 }
 
-                // Only liquid engines are worth naming here; a solid booster sharing the stage
-                // must not be reported as "the engine this stage uses".
-                if (liquid && !titles.ContainsKey(part.inverseStage)) titles[part.inverseStage] = part.partInfo.title;
+                // Display name for the stage: any engine counts, solid boosters included; they are
+                // filtered out of the optimiser, but the table still has to show what is there.
+                if (!titles.ContainsKey(part.inverseStage)) titles[part.inverseStage] = part.partInfo.title;
 
                 bool seen;
                 anyLiquidByStage.TryGetValue(part.inverseStage, out seen);
@@ -630,7 +634,8 @@ namespace ShipEngineOptimization
                 stage.additionalMass = 0f;
                 // Each stage only lifts what is above it; the reader measures that per stage.
                 // Top stage carries the measured payload; lower stages get theirs from the chain.
-                stage.payloadMass = i == snapshots.Count - 1 ? measuredPayload : 0f;
+                stage.kspStage = snapshots[i].Stage;
+            stage.payloadMass = i == snapshots.Count - 1 ? measuredPayload : 0f;
                 if (stage.payloadMass <= 0f && i == 0) stage.payloadMass = measuredPayload;
                 stage.ownPayloadMass = stage.payloadMass;
                 rebuilt.Add(stage);
